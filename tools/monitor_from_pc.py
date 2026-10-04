@@ -23,5 +23,7 @@ def send_udp_message(message):
         except socket.timeout:
             print("3秒以内に応答なし。Wi-Fi接続、ESP32のAP起動、UDPポートを確認してください。")
 
+
+
 if __name__ == "__main__":
     main()
