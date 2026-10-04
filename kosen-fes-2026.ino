@@ -1,28 +1,23 @@
+#include "sample.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <esp_system.h>
+#include <stdio.h>
 #include <string.h>
 
-// Godot sends HELLO packets to localPort. The ESP32 learns the PC's
-// address and return port from that packet, then streams sensor data back.
 const char *ssid = "not-a-raspberrypi";
 const char *password = "1145141919810";
 const unsigned int localPort = 8888;
 const unsigned long sensorSendIntervalMs = 100; // 10 Hz
 const unsigned long pcTimeoutMs = 5000;
 
-struct SensorData {
-  float accelX;
-  float accelY;
-  float accelZ;
-  float gyroX;
-  float gyroY;
-  float gyroZ;
-};
-
-SensorData sampleData() {
-  // Replace these placeholders with readings from the actual sensor.
-  return {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+SensorData sampleData(int loop_index) {
+  if (loop_index >= SAMPLE_DATA_LENGTH) {
+    loop_index %= (SAMPLE_DATA_LENGTH + 1);
+  }
+  printf("サンプルデータのインデックス: %d\n", loop_index);
+  return rightTurn360Samples[loop_index];
 }
 
 WiFiUDP udp;
@@ -52,14 +47,76 @@ void sendToPc(const char *message) {
   }
 }
 
+void connectToPc() {
+  unsigned long lastWaitingLogMs = millis();
+  printf("PCからのUDP通信を待機中...\n");
+  while (!pcKnown) {
+    const int packetSize = udp.parsePacket();
+    if (packetSize >= static_cast<int>(sizeof(packetBuffer))) {
+      // Reserve one byte for the terminator and discard oversized datagrams.
+      printf("ERROR: UDPパケットが大きすぎます: %d byte\n", packetSize);
+      udp.flush();
+    } else if (packetSize > 0) {
+      const int length = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
+      if (length > 0) {
+        packetBuffer[length] = '\0';
+        printf("PCからの通信を受信: %s\n", packetBuffer);
+        pcAddress = udp.remoteIP();
+        pcPort = udp.remotePort();
+        pcKnown = true;
+      } else {
+        printf("ERROR: UDP読み込みに失敗しました: %d\n", length);
+      }
+    }
+    if (millis() - lastWaitingLogMs >= 1000) {
+      lastWaitingLogMs = millis();
+      printf("PC待機中: Wi-Fi接続台数=%u, heap=%u\n",
+             static_cast<unsigned int>(WiFi.softAPgetStationNum()),
+             static_cast<unsigned int>(ESP.getFreeHeap()));
+    }
+    delay(100);
+  }
+}
+
 void setup() {
+  // Keep diagnostics visible even when the following call blocks or crashes.
+  setvbuf(stdout, nullptr, _IONBF, 0);
   delay(500);
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  printf("BOOT: chip=%s, resetReason=%d, heap=%u\n", ESP.getChipModel(),
+         static_cast<int>(resetReason),
+         static_cast<unsigned int>(ESP.getFreeHeap()));
+  if (resetReason == ESP_RST_BROWNOUT) {
+    printf("BOOT: 前回は電圧低下によるリセットでした\n");
+  } else if (resetReason == ESP_RST_PANIC) {
+    printf("BOOT: 前回はパニックによるリセットでした\n");
+  } else if (resetReason == ESP_RST_TASK_WDT ||
+             resetReason == ESP_RST_INT_WDT || resetReason == ESP_RST_WDT) {
+    printf("BOOT: 前回はウォッチドッグによるリセットでした\n");
+  }
+
   printf("AP起動中: %s\n", ssid);
-  WiFi.mode(WIFI_AP);
+  printf("WiFi.mode(WIFI_AP): begin\n");
+  const unsigned long modeStartedMs = millis();
+  const bool modeReady = WiFi.mode(WIFI_AP);
+  printf("WiFi.mode(WIFI_AP): result=%d, elapsed=%lu ms, heap=%u\n", modeReady,
+         millis() - modeStartedMs,
+         static_cast<unsigned int>(ESP.getFreeHeap()));
+  if (!modeReady) {
+    printf("ERROR: Wi-Fi APモードへの切り替えに失敗しました\n");
+    return;
+  }
+
+  printf("WiFi.softAP(): begin\n");
+  const unsigned long apStartedMs = millis();
   apReady = WiFi.softAP(ssid, password);
+  printf("WiFi.softAP(): result=%d, elapsed=%lu ms, heap=%u\n", apReady,
+         millis() - apStartedMs, static_cast<unsigned int>(ESP.getFreeHeap()));
   if (!apReady) {
     printf("ERROR: Wi-Fi APを起動できませんでした\n");
     return;
+  } else {
+    printf("Wi-Fi APを起動しました: %s\n", ssid);
   }
 
   printf("AP起動成功。IP: %s\n", WiFi.softAPIP().toString().c_str());
@@ -69,51 +126,63 @@ void setup() {
     return;
   }
   printf("UDP待受開始: %u\n", localPort);
-  printf("GodotからHELLOが届くのを待っています\n");
+
+  // PCとの通信を確立
+  connectToPc();
 }
 
+int monitoring_index = 0; // 監視時間
+unsigned long first_time_stamp = 0;
+float current_time_from_start = 0;
+
 void loop() {
+
   if (!apReady) {
     delay(1000);
     return;
   }
 
-  const int packetSize = udp.parsePacket();
-  if (packetSize > 0) {
-    const int length = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
-    if (length >= 0) {
-      packetBuffer[length] = '\0';
-      pcAddress = udp.remoteIP();
-      pcPort = udp.remotePort();
-      pcKnown = true;
-      lastPcPacketMs = millis();
-
-      printf("受信 %d byte from %s:%u: %s\n", length,
-             pcAddress.toString().c_str(), pcPort, packetBuffer);
-      if (strcmp(packetBuffer, "HELLO") == 0) {
-        sendToPc("HELLO_ACK");
-      } else {
-        char response[280];
-        snprintf(response, sizeof(response), "ACK,%s", packetBuffer);
-        sendToPc(response);
-      }
-    }
+  if (!pcKnown) {
+    printf("PCとの通信を待機中...\n");
+    connectToPc();
+    return;
   }
 
+  lastPcPacketMs = millis();
+
   const unsigned long now = millis();
+  current_time_from_start = (now - first_time_stamp) / 1000.0;
+  // printf("経過時間: %.3f秒\n", current_time_from_start);
+
   if (pcKnown && now - lastPcPacketMs > pcTimeoutMs) {
     printf("PCからの通信がタイムアウトしました\n");
     pcKnown = false;
   }
 
   if (pcKnown && now - lastSensorSendMs >= sensorSendIntervalMs) {
+
+    if (monitoring_index == 0) {
+      first_time_stamp = millis();
+    }
+
     lastSensorSendMs = now;
-    const SensorData data = sampleData();
+
+    // MARK: センサーデータ（テスト用）
+    const SensorData data = sampleData(monitoring_index);
+
+    printf("送信データ: accel(%.3f, %.3f, %.3f), gyro(%.3f, %.3f, %.3f)\n",
+           data.accelX, data.accelY, data.accelZ, data.gyroX, data.gyroY,
+           data.gyroZ);
+
+    // MARK: データ送信
     char message[160];
     snprintf(message, sizeof(message), "DATA,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
-             now, data.accelX, data.accelY, data.accelZ,
-             data.gyroX, data.gyroY, data.gyroZ);
+             now, data.accelX, data.accelY, data.accelZ, data.gyroX, data.gyroY,
+             data.gyroZ);
+
     sendToPc(message);
+    // サンプルデータのテストののみ
+    monitoring_index++;
   }
   delay(1);
 }
