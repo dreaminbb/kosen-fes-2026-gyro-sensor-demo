@@ -14,7 +14,7 @@ const unsigned long pcTimeoutMs = 5000;
 
 SensorData sampleData(int loop_index) {
   if (loop_index >= SAMPLE_DATA_LENGTH) {
-    loop_index %= (SAMPLE_DATA_LENGTH + 1);
+    loop_index %= SAMPLE_DATA_LENGTH;
   }
   printf("サンプルデータのインデックス: %d\n", loop_index);
   return rightTurn360Samples[loop_index];
@@ -48,6 +48,7 @@ void sendToPc(const char *message) {
 }
 
 void connectToPc() {
+
   unsigned long lastWaitingLogMs = millis();
   printf("PCからのUDP通信を待機中...\n");
   while (!pcKnown) {
@@ -55,7 +56,7 @@ void connectToPc() {
     if (packetSize >= static_cast<int>(sizeof(packetBuffer))) {
       // Reserve one byte for the terminator and discard oversized datagrams.
       printf("ERROR: UDPパケットが大きすぎます: %d byte\n", packetSize);
-      udp.flush();
+      udp.clear();
     } else if (packetSize > 0) {
       const int length = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
       if (length > 0) {
@@ -68,7 +69,9 @@ void connectToPc() {
         printf("ERROR: UDP読み込みに失敗しました: %d\n", length);
       }
     }
+
     if (millis() - lastWaitingLogMs >= 1000) {
+
       lastWaitingLogMs = millis();
       printf("PC待機中: Wi-Fi接続台数=%u, heap=%u\n",
              static_cast<unsigned int>(WiFi.softAPgetStationNum()),
@@ -86,6 +89,7 @@ void setup() {
   printf("BOOT: chip=%s, resetReason=%d, heap=%u\n", ESP.getChipModel(),
          static_cast<int>(resetReason),
          static_cast<unsigned int>(ESP.getFreeHeap()));
+
   if (resetReason == ESP_RST_BROWNOUT) {
     printf("BOOT: 前回は電圧低下によるリセットでした\n");
   } else if (resetReason == ESP_RST_PANIC) {
