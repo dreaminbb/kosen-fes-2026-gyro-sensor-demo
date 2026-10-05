@@ -1,192 +1,347 @@
 #include "sample.h"
+
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
-#include <esp_system.h>
+#include <sl_bluetooth.h>
+#include <sl_bt_api.h>
 #include <stdio.h>
 #include <string.h>
+#include "arduino_serial_config.h"
 
-const char *ssid = "not-a-raspberrypi";
-const char *password = "1145141919810";
-const unsigned int localPort = 8888;
-const unsigned long sensorSendIntervalMs = 100; // 10 Hz
-const unsigned long pcTimeoutMs = 5000;
+namespace {
 
-SensorData sampleData(int loop_index) {
-  if (loop_index >= SAMPLE_DATA_LENGTH) {
-    loop_index %= SAMPLE_DATA_LENGTH;
-  }
-  printf("サンプルデータのインデックス: %d\n", loop_index);
-  return rightTurn360Samples[loop_index];
-}
+const uint8_t advertisedName[] = "KosenBall";
+const uint16_t gattValueMaxLength = 250;
+const uint16_t defaultNotificationPayloadSize = 20;
+const unsigned long sensorSendIntervalMs = RIGHT_TURN_SAMPLE_INTERVAL_MS;
 
-WiFiUDP udp;
-char packetBuffer[256];
-bool apReady = false;
-bool pcKnown = false;
-IPAddress pcAddress;
-unsigned int pcPort = 0;
-unsigned long lastPcPacketMs = 0;
+const uuid_128 sppServiceUuid = {.data = {0x07, 0xb9, 0xf9, 0xd7, 0x50, 0xa4,
+                                          0x20, 0x89, 0x77, 0x40, 0xcb, 0xfd,
+                                          0x2c, 0xc1, 0x80, 0x48}};
+const uuid_128 sppDataCharacteristicUuid = {
+    .data = {0xd6, 0x58, 0xd6, 0x21, 0xbc, 0x55, 0x81, 0x9f, 0x42, 0x44, 0x71,
+             0x6d, 0xc4, 0x6e, 0xc2, 0xfe}};
+
+uint16_t gattDbSessionId = 0;
+uint16_t genericAccessServiceHandle = 0;
+uint16_t deviceNameCharacteristicHandle = 0;
+uint16_t sensorServiceHandle = 0;
+uint16_t sensorDataCharacteristicHandle = 0;
+uint8_t advertisingSetHandle = 0xff;
+uint8_t connectionHandle = SL_BT_INVALID_CONNECTION_HANDLE;
+uint16_t notificationPayloadSize = defaultNotificationPayloadSize;
+
+bool advertisingSetInitialized = false;
+bool notificationsEnabled = false;
+bool streamingEnabled = true;
+bool sessionClockStarted = false;
+int monitoringIndex = 0;
+unsigned long sessionStartedMs = 0;
 unsigned long lastSensorSendMs = 0;
 
-void sendToPc(const char *message) {
-  if (!pcKnown) {
-    return;
+char commandBuffer[64];
+size_t commandLength = 0;
+
+bool reportBleStatus(const char *operation, sl_status_t status) {
+  if (status == SL_STATUS_OK) {
+    return true;
   }
-  if (!udp.beginPacket(pcAddress, pcPort)) {
-    printf("UDP送信開始に失敗しました\n");
-    return;
-  }
-  udp.write(reinterpret_cast<const uint8_t *>(message), strlen(message));
-  if (udp.endPacket() == 1) {
-    if (strncmp(message, "DATA,", 5) != 0) {
-      printf("送信: %s\n", message);
-    }
-  } else {
-    printf("UDP送信に失敗しました\n");
-  }
+
+  printf("ERROR: %s failed with BLE status 0x%08lX\n", operation,
+         static_cast<unsigned long>(status));
+  return false;
 }
 
-void connectToPc() {
-
-  unsigned long lastWaitingLogMs = millis();
-  printf("PCからのUDP通信を待機中...\n");
-  while (!pcKnown) {
-    const int packetSize = udp.parsePacket();
-    if (packetSize >= static_cast<int>(sizeof(packetBuffer))) {
-      // Reserve one byte for the terminator and discard oversized datagrams.
-      printf("ERROR: UDPパケットが大きすぎます: %d byte\n", packetSize);
-      udp.clear();
-    } else if (packetSize > 0) {
-      const int length = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
-      if (length > 0) {
-        packetBuffer[length] = '\0';
-        printf("PCからの通信を受信: %s\n", packetBuffer);
-        pcAddress = udp.remoteIP();
-        pcPort = udp.remotePort();
-        pcKnown = true;
-      } else {
-        printf("ERROR: UDP読み込みに失敗しました: %d\n", length);
-      }
-    }
-
-    if (millis() - lastWaitingLogMs >= 1000) {
-
-      lastWaitingLogMs = millis();
-      printf("PC待機中: Wi-Fi接続台数=%u, heap=%u\n",
-             static_cast<unsigned int>(WiFi.softAPgetStationNum()),
-             static_cast<unsigned int>(ESP.getFreeHeap()));
-    }
-    delay(100);
+bool initializeGattDatabase() {
+  sl_status_t status = sl_bt_gattdb_new_session(&gattDbSessionId);
+  if (!reportBleStatus("sl_bt_gattdb_new_session", status)) {
+    return false;
   }
+
+  const uint8_t genericAccessServiceUuid[] = {0x00, 0x18};
+  status = sl_bt_gattdb_add_service(
+      gattDbSessionId, sl_bt_gattdb_primary_service,
+      SL_BT_GATTDB_ADVERTISED_SERVICE, sizeof(genericAccessServiceUuid),
+      genericAccessServiceUuid, &genericAccessServiceHandle);
+  if (!reportBleStatus("add Generic Access service", status)) {
+    return false;
+  }
+
+  const sl_bt_uuid_16_t deviceNameUuid = {.data = {0x00, 0x2a}};
+  status = sl_bt_gattdb_add_uuid16_characteristic(
+      gattDbSessionId, genericAccessServiceHandle,
+      SL_BT_GATTDB_CHARACTERISTIC_READ, 0, 0, deviceNameUuid,
+      sl_bt_gattdb_fixed_length_value, sizeof(advertisedName) - 1,
+      sizeof(advertisedName) - 1, advertisedName,
+      &deviceNameCharacteristicHandle);
+  if (!reportBleStatus("add device name characteristic", status)) {
+    return false;
+  }
+
+  status =
+      sl_bt_gattdb_start_service(gattDbSessionId, genericAccessServiceHandle);
+  if (!reportBleStatus("start Generic Access service", status)) {
+    return false;
+  }
+
+  status = sl_bt_gattdb_add_service(
+      gattDbSessionId, sl_bt_gattdb_primary_service,
+      SL_BT_GATTDB_ADVERTISED_SERVICE, sizeof(sppServiceUuid),
+      sppServiceUuid.data, &sensorServiceHandle);
+  if (!reportBleStatus("add sensor service", status)) {
+    return false;
+  }
+
+  const uint8_t initialCharacteristicValue = 0;
+  status = sl_bt_gattdb_add_uuid128_characteristic(
+      gattDbSessionId, sensorServiceHandle,
+      SL_BT_GATTDB_CHARACTERISTIC_WRITE_NO_RESPONSE |
+          SL_BT_GATTDB_CHARACTERISTIC_NOTIFY,
+      0, 0, sppDataCharacteristicUuid, sl_bt_gattdb_fixed_length_value,
+      gattValueMaxLength, sizeof(initialCharacteristicValue),
+      &initialCharacteristicValue, &sensorDataCharacteristicHandle);
+  if (!reportBleStatus("add sensor data characteristic", status)) {
+    return false;
+  }
+
+  status = sl_bt_gattdb_start_service(gattDbSessionId, sensorServiceHandle);
+  if (!reportBleStatus("start sensor service", status)) {
+    return false;
+  }
+
+  status = sl_bt_gattdb_commit(gattDbSessionId);
+  return reportBleStatus("commit GATT database", status);
 }
+
+bool startAdvertising() {
+  if (!advertisingSetInitialized) {
+    sl_status_t status = sl_bt_advertiser_create_set(&advertisingSetHandle);
+    if (!reportBleStatus("sl_bt_advertiser_create_set", status)) {
+      return false;
+    }
+
+    status = sl_bt_advertiser_set_timing(advertisingSetHandle, 160, 160, 0, 0);
+    if (!reportBleStatus("sl_bt_advertiser_set_timing", status)) {
+      return false;
+    }
+    advertisingSetInitialized = true;
+  }
+
+  sl_status_t status = sl_bt_legacy_advertiser_generate_data(
+      advertisingSetHandle, sl_bt_advertiser_general_discoverable);
+  if (!reportBleStatus("generate BLE advertisement", status)) {
+    return false;
+  }
+
+  status = sl_bt_legacy_advertiser_start(
+      advertisingSetHandle, sl_bt_advertiser_connectable_scannable);
+  if (!reportBleStatus("start BLE advertisement", status)) {
+    return false;
+  }
+
+  printf("BLE advertising as %s\n",
+         reinterpret_cast<const char *>(advertisedName));
+  return true;
+}
+
+bool sendNotificationText(const char *message) {
+  if (!notificationsEnabled ||
+      connectionHandle == SL_BT_INVALID_CONNECTION_HANDLE) {
+    return false;
+  }
+
+  const size_t messageLength = strlen(message);
+  size_t offset = 0;
+  while (offset < messageLength) {
+    const size_t remaining = messageLength - offset;
+    const size_t chunkLength = remaining < notificationPayloadSize
+                                   ? remaining
+                                   : notificationPayloadSize;
+    const sl_status_t status = sl_bt_gatt_server_send_notification(
+        connectionHandle, sensorDataCharacteristicHandle,
+        static_cast<uint8_t>(chunkLength),
+        reinterpret_cast<const uint8_t *>(message + offset));
+    if (!reportBleStatus("send BLE notification", status)) {
+      return false;
+    }
+    offset += chunkLength;
+  }
+  return true;
+}
+
+SensorData sampleData(int loopIndex) {
+  if (loopIndex < 0 || loopIndex >= SAMPLE_DATA_LENGTH) {
+    loopIndex %= SAMPLE_DATA_LENGTH;
+    if (loopIndex < 0) {
+      loopIndex += SAMPLE_DATA_LENGTH;
+    }
+  }
+
+  printf("サンプルデータのインデックス: %d\n", loopIndex);
+  return rightTurn360Samples[loopIndex];
+}
+
+void processCommand(const char *command) {
+  printf("BLE受信コマンド: %s\n", command);
+
+  const char *response = "ACK,UNKNOWN\n";
+  if (strcmp(command, "CMD,START") == 0) {
+    streamingEnabled = true;
+    response = "ACK,START\n";
+  } else if (strcmp(command, "CMD,STOP") == 0) {
+    streamingEnabled = false;
+    response = "ACK,STOP\n";
+  } else if (strcmp(command, "CMD,RESET") == 0) {
+    monitoringIndex = 0;
+    sessionClockStarted = false;
+    streamingEnabled = true;
+    response = "ACK,RESET\n";
+  }
+
+  sendNotificationText(response);
+}
+
+void processCommandByte(uint8_t byte) {
+  if (byte == '\r') {
+    return;
+  }
+
+  if (byte == '\n') {
+    commandBuffer[commandLength] = '\0';
+    if (commandLength > 0) {
+      processCommand(commandBuffer);
+    }
+    commandLength = 0;
+    return;
+  }
+
+  if (commandLength >= sizeof(commandBuffer) - 1) {
+    commandLength = 0;
+    printf("ERROR: BLE command is too long; discarded\n");
+    return;
+  }
+
+  commandBuffer[commandLength++] = static_cast<char>(byte);
+}
+
+} // namespace
 
 void setup() {
-  // Keep diagnostics visible even when the following call blocks or crashes.
-  setvbuf(stdout, nullptr, _IONBF, 0);
-  delay(500);
-  const esp_reset_reason_t resetReason = esp_reset_reason();
-  printf("BOOT: chip=%s, resetReason=%d, heap=%u\n", ESP.getChipModel(),
-         static_cast<int>(resetReason),
-         static_cast<unsigned int>(ESP.getFreeHeap()));
-
-  if (resetReason == ESP_RST_BROWNOUT) {
-    printf("BOOT: 前回は電圧低下によるリセットでした\n");
-  } else if (resetReason == ESP_RST_PANIC) {
-    printf("BOOT: 前回はパニックによるリセットでした\n");
-  } else if (resetReason == ESP_RST_TASK_WDT ||
-             resetReason == ESP_RST_INT_WDT || resetReason == ESP_RST_WDT) {
-    printf("BOOT: 前回はウォッチドッグによるリセットでした\n");
-  }
-
-  printf("AP起動中: %s\n", ssid);
-  printf("WiFi.mode(WIFI_AP): begin\n");
-  const unsigned long modeStartedMs = millis();
-  const bool modeReady = WiFi.mode(WIFI_AP);
-  printf("WiFi.mode(WIFI_AP): result=%d, elapsed=%lu ms, heap=%u\n", modeReady,
-         millis() - modeStartedMs,
-         static_cast<unsigned int>(ESP.getFreeHeap()));
-  if (!modeReady) {
-    printf("ERROR: Wi-Fi APモードへの切り替えに失敗しました\n");
-    return;
-  }
-
-  printf("WiFi.softAP(): begin\n");
-  const unsigned long apStartedMs = millis();
-  apReady = WiFi.softAP(ssid, password);
-  printf("WiFi.softAP(): result=%d, elapsed=%lu ms, heap=%u\n", apReady,
-         millis() - apStartedMs, static_cast<unsigned int>(ESP.getFreeHeap()));
-  if (!apReady) {
-    printf("ERROR: Wi-Fi APを起動できませんでした\n");
-    return;
-  } else {
-    printf("Wi-Fi APを起動しました: %s\n", ssid);
-  }
-
-  printf("AP起動成功。IP: %s\n", WiFi.softAPIP().toString().c_str());
-  if (udp.begin(localPort) != 1) {
-    printf("ERROR: UDPポート %u を開けませんでした\n", localPort);
-    apReady = false;
-    return;
-  }
-  printf("UDP待受開始: %u\n", localPort);
-
-  // PCとの通信を確立
-  connectToPc();
+  Serial.begin(115200);
+  // newlib printf uses the Silicon Labs default stream; route it to Arduino Serial/VCOM.
+  sl_iostream_set_system_default(sl_serial_stream_handle);
+  printf("XIAO MG24 BLE sensor peripheral starting\n");
 }
 
-int monitoring_index = 0; // 監視時間
-unsigned long first_time_stamp = 0;
-float current_time_from_start = 0;
-
 void loop() {
-
-  if (!apReady) {
-    delay(1000);
-    return;
-  }
-
-  if (!pcKnown) {
-    printf("PCとの通信を待機中...\n");
-    connectToPc();
-    return;
-  }
-
-  lastPcPacketMs = millis();
-
   const unsigned long now = millis();
-  current_time_from_start = (now - first_time_stamp) / 1000.0;
-  // printf("経過時間: %.3f秒\n", current_time_from_start);
-
-  if (pcKnown && now - lastPcPacketMs > pcTimeoutMs) {
-    printf("PCからの通信がタイムアウトしました\n");
-    pcKnown = false;
+  if (!notificationsEnabled || !streamingEnabled) {
+    delay(1);
+    return;
   }
 
-  if (pcKnown && now - lastSensorSendMs >= sensorSendIntervalMs) {
-
-    if (monitoring_index == 0) {
-      first_time_stamp = millis();
+  if (now - lastSensorSendMs >= sensorSendIntervalMs) {
+    lastSensorSendMs = now;
+    if (!sessionClockStarted) {
+      // Each sample represents the following 100 ms sensor interval.
+      sessionStartedMs = now - sensorSendIntervalMs;
+      sessionClockStarted = true;
     }
 
-    lastSensorSendMs = now;
+    const SensorData data = sampleData(monitoringIndex);
+    const unsigned long elapsedMs = now - sessionStartedMs;
+    char message[128];
+    const int messageLength = snprintf(
+        message, sizeof(message), "DATA,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+        elapsedMs, data.accelX, data.accelY, data.accelZ, data.gyroX,
+        data.gyroY, data.gyroZ);
 
-    // MARK: センサーデータ（テスト用）
-    const SensorData data = sampleData(monitoring_index);
+    if (messageLength > 0 &&
+        static_cast<size_t>(messageLength) < sizeof(message)) {
+      if (sendNotificationText(message)) {
+        printf("BLE送信: %s", message);
+      }
+    } else {
+      printf("ERROR: センサーデータの整形に失敗しました\n");
+    }
 
-    printf("送信データ: accel(%.3f, %.3f, %.3f), gyro(%.3f, %.3f, %.3f)\n",
-           data.accelX, data.accelY, data.accelZ, data.gyroX, data.gyroY,
-           data.gyroZ);
-
-    // MARK: データ送信
-    char message[160];
-    snprintf(message, sizeof(message), "DATA,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
-             now, data.accelX, data.accelY, data.accelZ, data.gyroX, data.gyroY,
-             data.gyroZ);
-
-    sendToPc(message);
-    // サンプルデータのテストののみ
-    monitoring_index++;
+    monitoringIndex = (monitoringIndex + 1) % SAMPLE_DATA_LENGTH;
   }
+
   delay(1);
+}
+
+void sl_bt_on_event(sl_bt_msg_t *event) {
+  switch (SL_BT_MSG_ID(event->header)) {
+  case sl_bt_evt_system_boot_id:
+    printf("BLE stack booted\n");
+    if (initializeGattDatabase()) {
+      startAdvertising();
+    }
+    break;
+
+  case sl_bt_evt_connection_opened_id:
+    connectionHandle = event->data.evt_connection_opened.connection;
+    notificationsEnabled = false;
+    streamingEnabled = true;
+    monitoringIndex = 0;
+    sessionClockStarted = false;
+    printf("BLE central connected; waiting for notification subscription\n");
+    break;
+
+  case sl_bt_evt_connection_closed_id:
+    printf("BLE central disconnected\n");
+    connectionHandle = SL_BT_INVALID_CONNECTION_HANDLE;
+    notificationsEnabled = false;
+    streamingEnabled = true;
+    monitoringIndex = 0;
+    sessionClockStarted = false;
+    commandLength = 0;
+    startAdvertising();
+    break;
+
+  case sl_bt_evt_gatt_mtu_exchanged_id: {
+    const uint16_t mtu = event->data.evt_gatt_mtu_exchanged.mtu;
+    if (mtu > 3) {
+      const uint16_t payloadSize = mtu - 3;
+      notificationPayloadSize =
+          payloadSize < gattValueMaxLength ? payloadSize : gattValueMaxLength;
+    }
+    printf("BLE MTU: %u, payload: %u\n", static_cast<unsigned>(mtu),
+           static_cast<unsigned>(notificationPayloadSize));
+    break;
+  }
+
+  case sl_bt_evt_gatt_server_characteristic_status_id: {
+    const sl_bt_evt_gatt_server_characteristic_status_t &status =
+        event->data.evt_gatt_server_characteristic_status;
+    if (status.characteristic == sensorDataCharacteristicHandle &&
+        status.status_flags == sl_bt_gatt_server_client_config) {
+      notificationsEnabled =
+          status.client_config_flags == sl_bt_gatt_server_notification;
+      if (notificationsEnabled) {
+        monitoringIndex = 0;
+        sessionClockStarted = false;
+        lastSensorSendMs = millis();
+        printf("BLE notifications enabled; streaming sensor data\n");
+      } else {
+        printf("BLE notifications disabled\n");
+      }
+    }
+    break;
+  }
+
+  case sl_bt_evt_gatt_server_attribute_value_id: {
+    const sl_bt_evt_gatt_server_attribute_value_t &value =
+        event->data.evt_gatt_server_attribute_value;
+    if (value.attribute == sensorDataCharacteristicHandle) {
+      for (uint8_t i = 0; i < value.value.len; ++i) {
+        processCommandByte(value.value.data[i]);
+      }
+    }
+    break;
+  }
+
+  default:
+    break;
+  }
 }
