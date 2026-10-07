@@ -1,17 +1,15 @@
 extends Control
 
-const DEVICE_NAME := "KosenBall"
-const SENSOR_SERVICE_UUID := "4880c12c-fdcb-4077-8920-a450d7f9b907"
-const SENSOR_DATA_CHARACTERISTIC_UUID := "fec26ec4-6d71-4442-9f81-55bc21d658d6"
-const MAX_WRITE_BYTES := 20
+const BAUD_RATE := 115200
+const MAX_SERIAL_LINE_LENGTH := 1024
 
-var bluetooth_manager: Object
-var ble_device: Object
-var ble_adapter_ready := false
-var ble_scanning := false
+var serial_process: Dictionary = {}
+var serial_stdio: FileAccess
+var serial_stderr: FileAccess
+var serial_pid := -1
 var connected_to_device := false
-var notifications_subscribed := false
-var ble_receive_buffer := ""
+var ble_link_ready := false
+var serial_receive_buffer := ""
 var notifications_received := 0
 var messages_received := 0
 var commands_sent := 0
@@ -21,6 +19,8 @@ var target_model_rotation := Quaternion.IDENTITY
 
 var command_select: OptionButton
 var send_button: Button
+var connection_button: Button
+var port_input: LineEdit
 var status_label: Label
 var disconnected_notice: PanelContainer
 var stats_label: Label
@@ -32,34 +32,16 @@ var model_root: Node3D
 
 func _ready() -> void:
 	_build_ui()
-	if not ClassDB.class_exists("BluetoothManager"):
-		_set_status("BLE拡張 GDBLE が読み込まれていません。")
-		_log("addons/gdble のGDExtensionを確認してください。")
-		return
-
-	var manager = ClassDB.instantiate("BluetoothManager")
-	if manager == null or not (manager is Node):
-		_set_status("BluetoothManagerを作成できませんでした。")
-		_log("GDBLE拡張の読み込みに失敗しました。")
-		return
-
-	bluetooth_manager = manager
-	add_child(manager as Node)
-	bluetooth_manager.connect(
-		"adapter_initialized", Callable(self, "_on_adapter_initialized")
-	)
-	bluetooth_manager.connect(
-		"device_discovered", Callable(self, "_on_device_discovered")
-	)
-	bluetooth_manager.connect(
-		"error_occurred", Callable(self, "_on_bluetooth_error")
-	)
-	_set_status("Bluetoothアダプターを初期化しています…")
-	_log("GDBLE Bluetooth Low Energy 拡張を初期化しています。")
-	bluetooth_manager.call("initialize")
+	port_input.text = _find_default_serial_port()
+	if not port_input.text.is_empty():
+		_connect_serial()
+	else:
+		_set_status("C6のシリアルポートを入力してください。")
+		_log("ポート例: macOS /dev/cu.usbmodemXXXX、Linux /dev/ttyACM0")
 
 
 func _process(delta: float) -> void:
+	_poll_serial()
 	if is_instance_valid(model_root):
 		model_root.quaternion = model_root.quaternion.slerp(
 			target_model_rotation, 1.0 - exp(-8.0 * delta)
@@ -85,7 +67,7 @@ func _build_ui() -> void:
 	layout.add_child(header)
 
 	var title := Label.new()
-	title.text = "XIAO MG24 BLE 5.3 Monitor"
+	title.text = "XIAO MG24 ↔ ESP32-C6 BLE Monitor"
 	title.add_theme_font_size_override("font_size", 24)
 	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	header.add_child(title)
@@ -106,15 +88,30 @@ func _build_ui() -> void:
 	var notice_label := Label.new()
 	notice_label.text = "未接続"
 	notice_label.add_theme_color_override("font_color", Color("fee2e2"))
-	notice_label.tooltip_text = "KosenBallのBLE接続を待っています"
+	notice_label.tooltip_text = "C6のUSBシリアル接続を待っています"
 	disconnected_notice.add_child(notice_label)
 
 	status_label = Label.new()
-	status_label.text = "Bluetoothを準備中…"
+	status_label.text = "C6シリアルを準備中…"
 	layout.add_child(status_label)
 
+	var serial_row := HBoxContainer.new()
+	serial_row.add_theme_constant_override("separation", 8)
+	layout.add_child(serial_row)
+	var port_label := Label.new()
+	port_label.text = "C6ポート"
+	serial_row.add_child(port_label)
+	port_input = LineEdit.new()
+	port_input.placeholder_text = "/dev/cu.usbmodemXXXX または COM3"
+	port_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	serial_row.add_child(port_input)
+	connection_button = Button.new()
+	connection_button.text = "シリアル接続"
+	connection_button.pressed.connect(_on_connection_button_pressed)
+	serial_row.add_child(connection_button)
+
 	stats_label = Label.new()
-	stats_label.text = "BLE通知 0  |  受信行 0  |  送信コマンド 0"
+	stats_label.text = "シリアル受信 0  |  受信行 0  |  送信コマンド 0"
 	layout.add_child(stats_label)
 
 	telemetry_label = Label.new()
@@ -146,7 +143,7 @@ func _build_ui() -> void:
 	layout.add_child(command_row)
 
 	var command_label := Label.new()
-	command_label.text = "Godot → MG24"
+	command_label.text = "Godot → C6 → MG24"
 	command_row.add_child(command_label)
 
 	command_select = OptionButton.new()
@@ -158,7 +155,7 @@ func _build_ui() -> void:
 	command_row.add_child(command_select)
 
 	send_button = Button.new()
-	send_button.text = "BLEコマンド送信"
+	send_button.text = "コマンド送信"
 	send_button.disabled = true
 	send_button.pressed.connect(_send_command)
 	command_row.add_child(send_button)
@@ -172,217 +169,200 @@ func _build_ui() -> void:
 	layout.add_child(log_output)
 
 
-func _on_adapter_initialized(success: bool, error: String) -> void:
-	if not success:
-		_set_status("Bluetooth初期化失敗: %s" % error)
-		_log("Bluetoothアダプターを初期化できませんでした: %s" % error)
+func _find_default_serial_port() -> String:
+	var entries := DirAccess.get_files_at("/dev")
+	var candidates: Array[String] = []
+	for entry in entries:
+		if entry.begins_with("cu.usbmodem") or entry.begins_with("cu.wchusbserial"):
+			candidates.append("/dev/" + entry)
+		elif entry.begins_with("ttyACM") or entry.begins_with("ttyUSB"):
+			candidates.append("/dev/" + entry)
+	candidates.sort()
+	return candidates[0] if not candidates.is_empty() else ""
+
+
+func _on_connection_button_pressed() -> void:
+	if connected_to_device:
+		_disconnect_serial()
+	else:
+		_connect_serial()
+
+
+func _connect_serial() -> void:
+	if connected_to_device:
+		return
+	var port := port_input.text.strip_edges()
+	if port.is_empty():
+		_set_status("シリアルポートを入力してください。")
+		return
+	var cli_path := _find_arduino_cli()
+	if cli_path.is_empty():
+		_set_status("arduino-cli が見つかりません。")
+		_log("arduino-cliをPATHに追加してGodotを起動してください。")
 		return
 
-	ble_adapter_ready = true
-	_log("Bluetoothアダプターの準備ができました。%s を検索します。" % DEVICE_NAME)
-	_start_scan()
-
-
-func _start_scan() -> void:
-	if not ble_adapter_ready or connected_to_device or ble_scanning:
-		return
-
-	var operation_id := int(bluetooth_manager.call("start_scan", 0.0))
-	if operation_id <= 0:
-		_set_status("BLEスキャンを開始できませんでした。")
-		_log("GDBLEからスキャン開始要求が受理されませんでした。")
-		return
-
-	ble_scanning = true
-	_set_status("%s をBLEスキャン中…" % DEVICE_NAME)
-	_log("BLEデバイスを検索しています。")
-
-
-func _on_device_discovered(info: Dictionary) -> void:
-	if connected_to_device or ble_device != null:
-		return
-	if str(info.get("name", "")) != DEVICE_NAME:
-		return
-
-	var address := str(info.get("address", ""))
-	if address.is_empty():
-		_log("KosenBallを検出しましたが、接続アドレスがありません。")
-		return
-
-	ble_scanning = false
-	bluetooth_manager.call("stop_scan")
-	_set_status("KosenBallを検出。接続しています…")
-	_log("KosenBallを検出しました (%s)" % address)
-
-	var device = bluetooth_manager.call("get_or_create_device", address)
-	if device == null:
-		_set_status("BLEデバイスを作成できませんでした。")
-		_log("GDBLEからデバイスを取得できませんでした。")
-		_restart_scan()
-		return
-
-	ble_device = device
-	ble_device.connect("connected", Callable(self, "_on_device_connected"))
-	ble_device.connect("disconnected", Callable(self, "_on_device_disconnected"))
-	ble_device.connect(
-		"connection_failed", Callable(self, "_on_connection_failed")
+	var result := OS.execute_with_pipe(
+		cli_path,
+		["monitor", "--port", port, "--config", "baudrate=%d" % BAUD_RATE],
+		false
 	)
-	ble_device.connect(
-		"services_discovered", Callable(self, "_on_services_discovered")
-	)
-	ble_device.connect("ble_event", Callable(self, "_on_device_ble_event"))
-	ble_device.connect(
-		"operation_failed", Callable(self, "_on_device_operation_failed")
-	)
-	ble_device.call("connect_async")
+	if result.is_empty():
+		_set_status("シリアルモニターを起動できませんでした。")
+		_log("ポートが使用中か、arduino-cli monitorを起動できません。")
+		return
 
-
-func _on_device_connected() -> void:
+	serial_process = result
+	serial_stdio = result.get("stdio") as FileAccess
+	serial_stderr = result.get("stderr") as FileAccess
+	serial_pid = int(result.get("pid", -1))
+	serial_receive_buffer = ""
 	_set_connected(true)
-	_set_status("BLE接続済み。GATTサービスを検索しています…")
-	_log("KosenBallとBLE接続しました。")
-	ble_device.call("discover_services")
+	connection_button.text = "切断"
+	port_input.editable = false
+	_set_status("%s を115200 baudで開いています…" % port)
+	_log("arduino-cli monitorを起動しました: %s" % port)
 
 
-func _on_services_discovered(services: Array) -> void:
-	for service in services:
-		if str(service.get("uuid", "")).to_lower() != SENSOR_SERVICE_UUID:
-			continue
-		for characteristic in service.get("characteristics", []):
-			if (
-				str(characteristic.get("uuid", "")).to_lower()
-				== SENSOR_DATA_CHARACTERISTIC_UUID
-				and characteristic.get("properties", {}).get("notify", false)
-			):
-				var operation_id := int(
-					ble_device.call(
-						"subscribe_characteristic",
-						SENSOR_SERVICE_UUID,
-						SENSOR_DATA_CHARACTERISTIC_UUID
-					)
-				)
-				if operation_id <= 0:
-					_set_status("センサーデータ通知を購読できませんでした。")
-					_log("GATT通知の購読要求が受理されませんでした。")
-				else:
-					_set_status("GATT通知を購読しています…")
-					_log("センサーデータの通知を購読しています。")
-				return
-
-	_set_status("必要なGATTサービスまたは通知特性がありません。")
-	_log("ファームウェアのService UUIDとCharacteristic UUIDを確認してください。")
-	ble_device.call("disconnect")
+func _find_arduino_cli() -> String:
+	var candidates: Array[String] = []
+	if OS.get_name() == "macOS":
+		candidates = ["/opt/homebrew/bin/arduino-cli", "/usr/local/bin/arduino-cli"]
+	elif OS.get_name() == "Windows":
+		candidates = ["arduino-cli.exe"]
+	else:
+		candidates = ["/usr/bin/arduino-cli", "/usr/local/bin/arduino-cli", "/usr/bin/env"]
+	for candidate in candidates:
+		if candidate == "/usr/bin/env":
+			var lookup_output: Array = []
+			if OS.execute(candidate, ["which", "arduino-cli"], lookup_output) == 0 and not lookup_output.is_empty():
+				return str(lookup_output[0]).strip_edges()
+		elif candidate.get_base_dir() == "." or FileAccess.file_exists(candidate):
+			return candidate
+	return ""
 
 
-func _on_device_ble_event(event: Dictionary) -> void:
-	var operation := str(event.get("operation", ""))
-	var phase := str(event.get("phase", ""))
-	var characteristic_uuid := str(
-		event.get("characteristic_uuid", "")
-	).to_lower()
+func _disconnect_serial() -> void:
+	if serial_pid > 0 and OS.is_process_running(serial_pid):
+		OS.kill(serial_pid)
+	if serial_stdio != null:
+		serial_stdio.close()
+	if serial_stderr != null:
+		serial_stderr.close()
+	serial_stdio = null
+	serial_stderr = null
+	serial_process.clear()
+	serial_pid = -1
+	serial_receive_buffer = ""
+	ble_link_ready = false
+	_set_connected(false)
+	connection_button.text = "シリアル接続"
+	port_input.editable = true
+	_log("シリアルモニターを終了しました。")
 
-	if (
-		operation == "subscribe"
-		and phase == "succeeded"
-		and characteristic_uuid == SENSOR_DATA_CHARACTERISTIC_UUID
-	):
-		notifications_subscribed = true
-		send_button.disabled = false
-		_set_status("接続済み。BLEセンサーデータを受信中です。")
-		_log("BLE通知を購読しました。")
+
+func _exit_tree() -> void:
+	if connected_to_device:
+		_disconnect_serial()
+
+
+func _poll_serial() -> void:
+	if not connected_to_device:
+		return
+	if serial_pid > 0 and not OS.is_process_running(serial_pid):
+		_read_pipe(serial_stdio)
+		_read_pipe(serial_stderr)
+		_log("arduino-cli monitorが終了しました。")
+		serial_pid = -1
+		serial_stdio = null
+		serial_stderr = null
+		serial_process.clear()
+		_set_connected(false)
+		connection_button.text = "シリアル接続"
+		port_input.editable = true
+		return
+	_read_pipe(serial_stdio)
+	_read_pipe(serial_stderr)
+
+
+func _read_pipe(pipe: FileAccess) -> void:
+	if pipe == null:
+		return
+	var available := int(pipe.get_length())
+	if available <= 0:
+		return
+	var bytes := pipe.get_buffer(mini(available, 8192))
+	if bytes.is_empty():
+		return
+	if pipe == serial_stdio:
+		_ingest_serial_bytes(bytes)
+	else:
+		var error_text := bytes.get_string_from_utf8().strip_edges()
+		if not error_text.is_empty():
+			_log(error_text)
+
+
+func _ingest_serial_bytes(data: PackedByteArray) -> void:
+	serial_receive_buffer += data.get_string_from_utf8()
+	if serial_receive_buffer.length() > MAX_SERIAL_LINE_LENGTH:
+		serial_receive_buffer = ""
+		_log("シリアル受信行が長すぎるため破棄しました。")
 		return
 
-	if (
-		operation == "subscribe"
-		and phase == "failed"
-		and characteristic_uuid == SENSOR_DATA_CHARACTERISTIC_UUID
-	):
-		_set_status("BLE通知の購読に失敗しました。")
-		return
-
-	if (
-		operation == "notification"
-		and phase == "received"
-		and characteristic_uuid == SENSOR_DATA_CHARACTERISTIC_UUID
-	):
-		var data = event.get("data", PackedByteArray())
-		if data is PackedByteArray:
+	while true:
+		var newline_index := serial_receive_buffer.find("\n")
+		if newline_index < 0:
+			break
+		var line := serial_receive_buffer.substr(0, newline_index).strip_edges()
+		serial_receive_buffer = serial_receive_buffer.substr(newline_index + 1)
+		if line.begins_with("RX,"):
+			if not ble_link_ready:
+				ble_link_ready = true
+				send_button.disabled = false
+				_set_status("MG24とBLE接続済み。センサーデータを受信中です。")
+				_log("C6からMG24の受信データが届きました。")
 			notifications_received += 1
 			_update_stats()
-			_ingest_ble_bytes(data)
-
-
-func _on_device_disconnected() -> void:
-	_log("KosenBallとのBLE接続が切れました。再接続します。")
-	ble_device = null
-	_set_connected(false)
-	_restart_scan()
-
-
-func _on_connection_failed(error: String) -> void:
-	_log("KosenBallへのBLE接続に失敗しました: %s" % error)
-	ble_device = null
-	_set_connected(false)
-	_restart_scan()
-
-
-func _on_device_operation_failed(operation: String, error: String) -> void:
-	_log("BLE %s に失敗しました: %s" % [operation, error])
-
-
-func _on_bluetooth_error(error: String) -> void:
-	_log("Bluetoothエラー: %s" % error)
-
-
-func _restart_scan() -> void:
-	await get_tree().create_timer(1.0).timeout
-	_start_scan()
+			_handle_serial_message(line.trim_prefix("RX,"))
+		elif line.contains("BLE subscribed; bidirectional GATT ready"):
+			ble_link_ready = true
+			send_button.disabled = false
+			_set_status("MG24とBLE接続済み。センサーデータを受信中です。")
+			_log("C6とMG24の双方向BLEリンクが確立しました。")
+		elif line.contains("GATT disconnect event") or line.contains("BLE disconnected; will rescan"):
+			ble_link_ready = false
+			send_button.disabled = true
+			_set_status("MG24とのBLE切断。C6が再接続しています…")
+		elif line.begins_with("ERROR,") or line.begins_with("WARNING,"):
+			_log("C6: " + line)
 
 
 func _send_command() -> void:
-	if not notifications_subscribed or ble_device == null:
-		_log("BLE接続と通知購読が完了してからコマンドを送信してください。")
+	if not connected_to_device or not ble_link_ready or serial_stdio == null:
+		_log("C6のシリアル接続とMG24とのBLEリンク確立後に送信してください。")
 		return
-
 	var command := command_select.get_item_text(command_select.selected)
-	var payload := ("CMD," + command + "\n").to_utf8_buffer()
-	if payload.size() > MAX_WRITE_BYTES:
-		_log("送信コマンドがBLEの標準パケット長を超えています。")
-		return
-
-	var operation_id := int(
-		ble_device.call(
-			"write_characteristic",
-			SENSOR_SERVICE_UUID,
-			SENSOR_DATA_CHARACTERISTIC_UUID,
-			payload,
-			false
-		)
-	)
-	if operation_id <= 0:
-		_log("BLEコマンドの送信要求が受理されませんでした。")
-		return
-
+	serial_stdio.store_string("CMD,%s\n" % command)
+	serial_stdio.flush()
 	commands_sent += 1
 	_update_stats()
-	_log("送信コマンド: %s" % command)
+	_log("C6へコマンド送信: %s" % command)
 
 
 func _set_connected(is_connected: bool) -> void:
 	var connection_changed := connected_to_device != is_connected
 	connected_to_device = is_connected
 	disconnected_notice.visible = not is_connected
-	notifications_subscribed = false
-	send_button.disabled = not (is_connected and notifications_subscribed)
+	send_button.disabled = not (is_connected and ble_link_ready)
 
 	if not is_connected:
-		ble_receive_buffer = ""
+		ble_link_ready = false
+		serial_receive_buffer = ""
 		last_sensor_timestamp = -1
 		integrated_yaw = 0.0
 		target_model_rotation = Quaternion.IDENTITY
-		_set_status("未接続。%sを再検索しています…" % DEVICE_NAME)
+		_set_status("C6のシリアルポート未接続")
 	elif connection_changed:
-		_set_status("BLE接続済み。GATTサービスを検索しています…")
+		_set_status("C6のシリアルポートに接続しました。BLEリンクを待っています…")
 
 
 func _set_status(message: String) -> void:
@@ -390,24 +370,7 @@ func _set_status(message: String) -> void:
 		status_label.text = "状態: " + message
 
 
-func _ingest_ble_bytes(data: PackedByteArray) -> void:
-	ble_receive_buffer += data.get_string_from_utf8()
-	if ble_receive_buffer.length() > 1024:
-		ble_receive_buffer = ""
-		_log("BLE受信データが長すぎるため、未完了の行を破棄しました。")
-		return
-
-	while true:
-		var newline_index := ble_receive_buffer.find("\n")
-		if newline_index < 0:
-			break
-		var message := ble_receive_buffer.substr(0, newline_index).strip_edges()
-		ble_receive_buffer = ble_receive_buffer.substr(newline_index + 1)
-		if not message.is_empty():
-			_handle_ble_message(message)
-
-
-func _handle_ble_message(message: String) -> void:
+func _handle_serial_message(message: String) -> void:
 	if message.begins_with("DATA,"):
 		if not _update_telemetry(message):
 			return
@@ -423,12 +386,12 @@ func _handle_ble_message(message: String) -> void:
 		messages_received += 1
 		_update_stats()
 	else:
-		_log("未対応のBLEデータ: %s" % message)
+		_log("未対応のC6シリアル行: %s" % message)
 
 
 func _update_stats() -> void:
 	if is_instance_valid(stats_label):
-		stats_label.text = "BLE通知 %d  |  受信行 %d  |  送信コマンド %d" % [
+		stats_label.text = "シリアル行 %d  |  受信行 %d  |  送信コマンド %d" % [
 			notifications_received, messages_received, commands_sent
 		]
 
@@ -546,5 +509,6 @@ func _make_material(color: Color) -> StandardMaterial3D:
 
 
 func _log(message: String) -> void:
+	print(message)
 	if is_instance_valid(log_output):
 		log_output.append_text("%s\n" % message)

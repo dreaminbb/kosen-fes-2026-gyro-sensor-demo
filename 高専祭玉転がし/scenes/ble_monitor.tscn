@@ -1,8 +1,8 @@
-[gd_scene load_steps=2 format=3]
+[gd_scene format=3 uid="uid://cj1ch18srrq1i"]
 
-[ext_resource type="Script" path="res://scripts/ble_monitor.gd" id="1"]
+[ext_resource type="Script" uid="uid://b0ukyhdtpid7m" path="res://scripts/ble_monitor.gd" id="1"]
 
-[node name="BleMonitor" type="Control"]
+[node name="BleMonitor" type="Control" unique_id=607368965]
 layout_mode = 3
 anchors_preset = 15
 anchor_right = 1.0

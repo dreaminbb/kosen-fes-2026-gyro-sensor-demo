@@ -1,15 +1,21 @@
 #include "sample.h"
 
+#include "arduino_serial_config.h"
 #include <Arduino.h>
 #include <sl_bluetooth.h>
 #include <sl_bt_api.h>
 #include <stdio.h>
 #include <string.h>
-#include "arduino_serial_config.h"
 
 namespace {
 
 const uint8_t advertisedName[] = "KosenBall";
+const uint8_t serviceAdvertisingData[] = {
+    0x02, 0x01, 0x06, 0x11, 0x07, 0x07, 0xb9, 0xf9, 0xd7,
+    0x50, 0xa4, 0x20, 0x89, 0x77, 0x40, 0xcb, 0xfd,
+    0x2c, 0xc1, 0x80, 0x48};
+const uint8_t nameScanResponse[] = {
+    0x0a, 0x09, 'K', 'o', 's', 'e', 'n', 'B', 'a', 'l', 'l'};
 const uint16_t gattValueMaxLength = 250;
 const uint16_t defaultNotificationPayloadSize = 20;
 const unsigned long sensorSendIntervalMs = RIGHT_TURN_SAMPLE_INTERVAL_MS;
@@ -126,9 +132,17 @@ bool startAdvertising() {
     advertisingSetInitialized = true;
   }
 
-  sl_status_t status = sl_bt_legacy_advertiser_generate_data(
-      advertisingSetHandle, sl_bt_advertiser_general_discoverable);
-  if (!reportBleStatus("generate BLE advertisement", status)) {
+  sl_status_t status = sl_bt_legacy_advertiser_set_data(
+      advertisingSetHandle, sl_bt_advertiser_advertising_data_packet,
+      sizeof(serviceAdvertisingData), serviceAdvertisingData);
+  if (!reportBleStatus("set BLE service advertisement", status)) {
+    return false;
+  }
+
+  status = sl_bt_legacy_advertiser_set_data(
+      advertisingSetHandle, sl_bt_advertiser_scan_response_packet,
+      sizeof(nameScanResponse), nameScanResponse);
+  if (!reportBleStatus("set BLE name scan response", status)) {
     return false;
   }
 
@@ -227,7 +241,8 @@ void processCommandByte(uint8_t byte) {
 
 void setup() {
   Serial.begin(115200);
-  // newlib printf uses the Silicon Labs default stream; route it to Arduino Serial/VCOM.
+  // newlib printf uses the Silicon Labs default stream; route it to Arduino
+  // Serial/VCOM.
   sl_iostream_set_system_default(sl_serial_stream_handle);
   printf("XIAO MG24 BLE sensor peripheral starting\n");
 }
@@ -285,8 +300,22 @@ void sl_bt_on_event(sl_bt_msg_t *event) {
     streamingEnabled = true;
     monitoringIndex = 0;
     sessionClockStarted = false;
-    printf("BLE central connected; waiting for notification subscription\n");
+    printf("BLE central connected; requesting 7.5 ms interval\n");
+    reportBleStatus(
+        "request 7.5 ms BLE interval",
+        sl_bt_connection_set_parameters(connectionHandle, 6, 6, 0, 100, 0,
+                                        0xffff));
     break;
+
+  case sl_bt_evt_connection_parameters_id: {
+    const sl_bt_evt_connection_parameters_t &parameters =
+        event->data.evt_connection_parameters;
+    printf("BLE interval: %.2f ms, latency: %u, timeout: %u ms\n",
+           parameters.interval * 1.25f,
+           static_cast<unsigned>(parameters.latency),
+           static_cast<unsigned>(parameters.timeout) * 10);
+    break;
+  }
 
   case sl_bt_evt_connection_closed_id:
     printf("BLE central disconnected\n");
