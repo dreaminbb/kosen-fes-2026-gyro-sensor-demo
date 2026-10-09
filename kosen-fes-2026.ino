@@ -1,3 +1,5 @@
+// 処理の流れ: GATTサービスを作ってBLE広告し、C6との接続を待つ。
+// センサーデータを100msごとに通知し、START/STOP/RESETコマンドへACKを返す。
 #include "sample.h"
 
 #include "arduino_serial_config.h"

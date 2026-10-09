@@ -1,3 +1,5 @@
+// 処理の流れ: 送受信で共通の識別子、無線チャンネル、固定長パケット形式を定義する。
+// magicとversionで受信データを検証し、時刻・加速度・角速度を運ぶ。
 #ifndef ESPNOW_PROTOCOL_H
 #define ESPNOW_PROTOCOL_H
 

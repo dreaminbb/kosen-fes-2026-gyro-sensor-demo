@@ -1,3 +1,5 @@
+// 処理の流れ: ESP-NOW受信コールバックで検証済みパケットをキューへ積む。
+// loopでキューから取り出し、DATA行としてprintfでUSBシリアルへ出力する。
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Work around duplicate NimBLE MTU exchange in Arduino-ESP32 BLEClient."""
+"""処理の流れ: Arduino CLIからESP32コアのBLEClient.cppを探す。
+既知のMTU交換競合だけを安全に補正し、未対応のソース形式なら停止する。
+"""
 
 from pathlib import Path
 import subprocess

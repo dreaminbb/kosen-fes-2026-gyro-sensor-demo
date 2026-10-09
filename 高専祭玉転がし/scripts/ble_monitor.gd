@@ -1,3 +1,5 @@
+## 処理の流れ: arduino-cli monitorを起動し、C6のUSBシリアル出力を読む。
+## DATAで3D姿勢を更新し、画面のコマンドをシリアル経由でMG24へ送る。
 extends Control
 
 const BAUD_RATE := 115200

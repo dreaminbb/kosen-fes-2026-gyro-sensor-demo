@@ -1,3 +1,5 @@
+// 処理の流れ: Wi-Fi STAを固定チャンネルで初期化し、ブロードキャスト先を登録する。
+// 100msごとにセンサー試験パケットを作り、ESP-NOWで全端末へ送信する。
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>

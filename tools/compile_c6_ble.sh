@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 処理の流れ: Arduino-ESP32のMTU交換不具合を補正し、ESP32-C6用BLE Centralをコンパイルする。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

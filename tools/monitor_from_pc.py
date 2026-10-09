@@ -1,4 +1,6 @@
-"""Receive sensor data from the ESP32 UDP access point."""
+"""処理の流れ: PCからESP32のUDP APへHELLOを送り、応答を待つ。
+受信データを整形して表示し、無通信が続けば接続確認を再開する。
+"""
 
 import socket
 import time
@@ -25,7 +27,7 @@ def format_message(message: str) -> str:
 
 
 def main() -> None:
-    # Bind an ephemeral local port so the ESP32 can send replies back to us.
+    # ESP32から返信を受け取るため、空いているローカルポートを使う。
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(("0.0.0.0", 0))
         sock.settimeout(RECEIVE_TIMEOUT_SECONDS)
@@ -59,7 +61,7 @@ def main() -> None:
                     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] タイムアウト: 受信パケットなし")
 
                     if last_packet_at and time.monotonic() - last_packet_at >= RECONNECT_AFTER_SECONDS:
-                        # If the ESP32 rebooted, its setup waits for another HELLO.
+                        # ESP32が再起動していれば、HELLOを再送して通信を再開する。
                         next_hello_at = 0.0
                         last_packet_at = 0.0
                     continue

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 処理の流れ: Arduino CLIとESP32-C6のFQBNを確認し、ESP-NOW受信スケッチをコンパイルする。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

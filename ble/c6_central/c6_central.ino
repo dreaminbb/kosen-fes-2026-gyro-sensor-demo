@@ -1,3 +1,5 @@
+// 処理の流れ: BLE広告からMG24を探して接続し、GATT通知を購読する。
+// DATA/ACKはprintfでPCへ流し、PCからのCMDはBLE経由でMG24へ転送する。
 #include <Arduino.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLEClient.h>
