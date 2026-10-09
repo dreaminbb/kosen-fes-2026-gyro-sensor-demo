@@ -4,6 +4,7 @@
 """
 
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -11,15 +12,8 @@ import sys
 ORIGINAL = """        rc = ble_gattc_exchange_mtu(client->m_conn_id, nullptr, nullptr);
         if (rc != 0) {
 """
-OLD_PATCH = """        // Some peers have already started the MTU exchange at connection time.
-        // NimBLE reports BLE_HS_EALREADY in that case; the link is still valid.
-        if (rc == BLE_HS_EALREADY) {
-          rc = 0;
-        }
-"""
-NEW_PATCH = """        // Some peers have already started the MTU exchange at connection time.
-        // NimBLE reports BLE_HS_EALREADY in that case; the link is still valid,
-        // and there may be no further MTU event to release the connect waiter.
+PATCHED = """        // 接続時に相手側がMTU交換を開始済みの場合があるため、重複要求を処理する。
+        // BLE_HS_EALREADYは接続成功として扱い、待機中の接続処理を解除する。
         if (rc == BLE_HS_EALREADY) {
           rc = 0;
           if (client->m_pTaskData != nullptr) {
@@ -27,8 +21,13 @@ NEW_PATCH = """        // Some peers have already started the MTU exchange at co
           }
         }
 """
-PATCHED = ORIGINAL.replace("        if (rc != 0) {\n", NEW_PATCH + "        if (rc != 0) {\n", 1)
-MARKER = "// Some peers have already started the MTU exchange at connection time."
+PATCHED_ORIGINAL = ORIGINAL.replace(
+    "        if (rc != 0) {\n", PATCHED + "        if (rc != 0) {\n", 1
+)
+LEGACY_PATCH = re.compile(
+    r"(?ms)^ {8}(?://[^\n]*\n)+"
+    r"^ {8}if \(rc == BLE_HS_EALREADY\) \{.*?^ {8}\}\n"
+)
 
 
 def main() -> int:
@@ -48,15 +47,14 @@ def main() -> int:
 
     source = candidates[-1]
     contents = source.read_text()
-    if MARKER in contents and "BLEUtils::taskRelease(*client->m_pTaskData, 0);" in contents:
+    if PATCHED in contents:
         print(f"BLE MTU workaround already applied: {source}")
         return 0
-    if MARKER in contents:
-        if OLD_PATCH not in contents:
-            print(f"Found an unknown BLE MTU workaround in {source}", file=sys.stderr)
-            return 1
-        source.write_text(contents.replace(OLD_PATCH, NEW_PATCH, 1))
-        print(f"Updated BLE MTU workaround in {source}")
+    legacy_match = LEGACY_PATCH.search(contents)
+    if legacy_match is not None:
+        updated = LEGACY_PATCH.sub(PATCHED, contents, count=1)
+        source.write_text(updated)
+        print(f"BLE MTU workaround updated: {source}")
         return 0
     if ORIGINAL not in contents:
         print(
@@ -66,8 +64,8 @@ def main() -> int:
         )
         return 1
 
-    source.write_text(contents.replace(ORIGINAL, PATCHED, 1))
-    print(f"Applied BLE MTU workaround to {source}")
+    source.write_text(contents.replace(ORIGINAL, PATCHED_ORIGINAL, 1))
+    print(f"BLE MTU workaround applied: {source}")
     return 0
 
 

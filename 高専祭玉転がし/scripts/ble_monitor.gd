@@ -430,7 +430,7 @@ func _update_model_from_sensor(fields: PackedStringArray) -> void:
 	if last_sensor_timestamp >= 0:
 		elapsed_ms = (sensor_time - last_sensor_timestamp + 4294967296) % 4294967296
 	else:
-		# The first sample describes the first 100 ms interval of motion.
+		# 初回サンプルは最初の100ms間の動きを表す。
 		elapsed_ms = sensor_time
 	if elapsed_ms > 0 and elapsed_ms <= 1000:
 		integrated_yaw += deg_to_rad(gyro_z) * float(elapsed_ms) / 1000.0

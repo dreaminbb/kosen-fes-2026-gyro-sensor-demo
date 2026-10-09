@@ -2,18 +2,19 @@
 
 ## Project Structure & Module Organization
 
-- `kosen-fes-2026.ino` contains the Arduino entry points (`setup()` and `loop()`), the six-axis `SensorData` structure, and `sampleData()`. Sampling currently returns placeholder values; hardware initialization and transmission remain unfinished.
-- `document/通信方式.md` records communication choices for sending sensor readings to a PC running Godot: USB serial for wired use and Wi-Fi UDP for wireless use. BLE is not planned, despite the existing include.
-- `tool.sh` wraps Arduino CLI commands for ESP32-C6.
+- `kosen-fes-2026.ino` is the XIAO MG24 BLE peripheral and sends sensor samples through GATT notifications.
+- `ble/c6_central/c6_central.ino` is the XIAO ESP32-C6 BLE central; Godot reads its USB serial stream through `arduino-cli monitor`.
+- `高専祭玉転がし/scripts/ble_monitor.gd` implements the Godot monitor, command controls, telemetry parsing, and 3D preview. `document/通信方式.md` documents the BLE protocol.
+- `tools/compile_c6_ble.sh` applies the guarded Arduino-ESP32 MTU workaround and compiles the C6 firmware. No separate test or asset directories are configured.
 - `eim_config.toml` configures the local Espressif installer; `compile_flags.txt` is available for compiler tooling. `.pio/` holds local tooling output. No dedicated test or asset directories exist.
 
 ## Build, Test, and Development Commands
 
-Install Arduino CLI and the ESP32 board package supporting `esp32:esp32:esp32c6`. Run from the repository root:
+Install Arduino CLI, the Silicon Labs board package, and the ESP32 board package. Run from the repository root:
 
-- `bash tool.sh compile` — compile the sketch for ESP32-C6.
-- `bash tool.sh upload /dev/cu.usbmodemXXXX` — upload to the connected board after compiling; replace the example port with the actual device.
-- `bash tool.sh monitor /dev/cu.usbmodemXXXX` — open the serial monitor at 115200 baud.
+- `arduino-cli compile --fqbn "SiliconLabs:silabs:xiao_mg24:protocol_stack=ble_silabs" .` — compile the MG24 peripheral.
+- `bash tools/compile_c6_ble.sh` — compile the C6 central.
+- `godot --path '高専祭玉転がし'` — run the Godot serial monitor; Arduino CLI must be on `PATH` and the C6 port must be free.
 
 ## Coding Style & Naming Conventions
 
@@ -25,4 +26,4 @@ No automated test framework or coverage threshold is configured. Compile every f
 
 ## Commit & Pull Request Guidelines
 
-This checkout has no Git metadata, so commit conventions cannot be verified. Use concise, imperative commit subjects, such as `Implement UDP sensor transmission`. PRs should explain the behavior changed, link relevant issues, and report compilation and hardware validation. Update communication notes when transport decisions change. Keep credentials and machine-specific paths out of contributions; `eim_config.toml` is already ignored.
+Use concise, imperative commit subjects, such as `Add BLE telemetry bridge`. PRs should explain behavior changes and report compilation and hardware validation. Update communication notes when the BLE protocol changes. Keep credentials and machine-specific paths out of contributions; `eim_config.toml` is already ignored.

@@ -1,8 +1,0 @@
-[config]
-
-name="GDBLE"
-binary_type="local"
-binary="android/gdble-release.aar"
-local_dependencies=["android/btleplug-release.aar"]
-remote_dependencies=[]
-custom_maven_repos=[]

@@ -243,8 +243,7 @@ void processCommandByte(uint8_t byte) {
 
 void setup() {
   Serial.begin(115200);
-  // newlib printf uses the Silicon Labs default stream; route it to Arduino
-  // Serial/VCOM.
+  // printfの出力先をSilicon Labs標準ストリームからArduino Serial/VCOMへ切り替える。
   sl_iostream_set_system_default(sl_serial_stream_handle);
   printf("XIAO MG24 BLE sensor peripheral starting\n");
 }
@@ -259,7 +258,7 @@ void loop() {
   if (now - lastSensorSendMs >= sensorSendIntervalMs) {
     lastSensorSendMs = now;
     if (!sessionClockStarted) {
-      // Each sample represents the following 100 ms sensor interval.
+      // 各サンプルは直前から次の100ms区間を表す。
       sessionStartedMs = now - sensorSendIntervalMs;
       sessionClockStarted = true;
     }
