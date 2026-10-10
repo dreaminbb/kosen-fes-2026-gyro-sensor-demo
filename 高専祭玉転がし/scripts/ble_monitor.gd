@@ -1,9 +1,15 @@
-## 処理の流れ: arduino-cli monitorを起動し、C6のUSBシリアル出力を読む。
-## DATAで3D姿勢を更新し、画面のコマンドをシリアル経由でMG24へ送る。
+## PC側の処理:
+##   arduino-cli monitorでC6のUSBシリアルを開く -> RX,付きの通知データを改行単位で読む
+##   -> DATA行を解析してセンサー表示/3D姿勢を更新する。
+## 画面のCMDはUSBシリアルからC6へ渡り、C6がBLE経由でMG24へ転送する。
 extends Control
 
 const BAUD_RATE := 115200
-const MAX_SERIAL_LINE_LENGTH := 1024
+const MAX_SERIAL_LINE_BYTES := 16384
+const SERIAL_READ_CHUNK_BYTES := 8192
+const MAX_SERIAL_READ_BYTES_PER_FRAME := 65536
+# 50 Hzの入力に追従しつつ、描画フレームごとの補間で姿勢変化を滑らかにする。
+const ROTATION_SMOOTHING_RATE := 16.0
 
 var serial_process: Dictionary = {}
 var serial_stdio: FileAccess
@@ -11,7 +17,8 @@ var serial_stderr: FileAccess
 var serial_pid := -1
 var connected_to_device := false
 var ble_link_ready := false
-var serial_receive_buffer := ""
+var serial_receive_buffer := PackedByteArray()
+var discarding_serial_line := false
 var notifications_received := 0
 var messages_received := 0
 var commands_sent := 0
@@ -46,7 +53,7 @@ func _process(delta: float) -> void:
 	_poll_serial()
 	if is_instance_valid(model_root):
 		model_root.quaternion = model_root.quaternion.slerp(
-			target_model_rotation, 1.0 - exp(-8.0 * delta)
+			target_model_rotation, 1.0 - exp(-ROTATION_SMOOTHING_RATE * delta)
 		)
 
 
@@ -203,6 +210,7 @@ func _connect_serial() -> void:
 		_log("arduino-cliをPATHに追加してGodotを起動してください。")
 		return
 
+	# C6がBLE通知を出力するシリアルポートをarduino-cli monitor経由で開く。
 	var result := OS.execute_with_pipe(
 		cli_path,
 		["monitor", "--port", port, "--config", "baudrate=%d" % BAUD_RATE],
@@ -217,7 +225,8 @@ func _connect_serial() -> void:
 	serial_stdio = result.get("stdio") as FileAccess
 	serial_stderr = result.get("stderr") as FileAccess
 	serial_pid = int(result.get("pid", -1))
-	serial_receive_buffer = ""
+	serial_receive_buffer.clear()
+	discarding_serial_line = false
 	_set_connected(true)
 	connection_button.text = "切断"
 	port_input.editable = false
@@ -254,7 +263,8 @@ func _disconnect_serial() -> void:
 	serial_stderr = null
 	serial_process.clear()
 	serial_pid = -1
-	serial_receive_buffer = ""
+	serial_receive_buffer.clear()
+	discarding_serial_line = false
 	ble_link_ready = false
 	_set_connected(false)
 	connection_button.text = "シリアル接続"
@@ -289,59 +299,81 @@ func _poll_serial() -> void:
 func _read_pipe(pipe: FileAccess) -> void:
 	if pipe == null:
 		return
-	var available := int(pipe.get_length())
-	if available <= 0:
-		return
-	var bytes := pipe.get_buffer(mini(available, 8192))
-	if bytes.is_empty():
-		return
-	if pipe == serial_stdio:
-		_ingest_serial_bytes(bytes)
-	else:
-		var error_text := bytes.get_string_from_utf8().strip_edges()
-		if not error_text.is_empty():
-			_log(error_text)
+	# 1回の読み取りで止めず、描画を独占しない範囲で溜まったデータを取り込む。
+	var remaining := MAX_SERIAL_READ_BYTES_PER_FRAME
+	while remaining > 0:
+		var available := int(pipe.get_length())
+		if available <= 0:
+			break
+		var bytes := pipe.get_buffer(mini(available, mini(remaining, SERIAL_READ_CHUNK_BYTES)))
+		if bytes.is_empty():
+			break
+		remaining -= bytes.size()
+		if pipe == serial_stdio:
+			_ingest_serial_bytes(bytes)
+		else:
+			var error_text := bytes.get_string_from_utf8().strip_edges()
+			if not error_text.is_empty():
+				_log(error_text)
 
 
 func _ingest_serial_bytes(data: PackedByteArray) -> void:
-	serial_receive_buffer += data.get_string_from_utf8()
-	if serial_receive_buffer.length() > MAX_SERIAL_LINE_LENGTH:
-		serial_receive_buffer = ""
-		_log("シリアル受信行が長すぎるため破棄しました。")
-		return
-
+	# LFまでバイト列を保持し、UTF-8の途中で読み取りが分かれても復元する。
+	# 容量制限は1行に適用する。複数の正常な行の合計サイズでは破棄しない。
+	var start := 0
+	if discarding_serial_line:
+		var end := data.find(10)
+		if end < 0:
+			return
+		discarding_serial_line = false
+		start = end + 1
+	serial_receive_buffer.append_array(data.slice(start))
+	var consumed := 0
 	while true:
-		var newline_index := serial_receive_buffer.find("\n")
+		var newline_index := serial_receive_buffer.find(10, consumed)
 		if newline_index < 0:
 			break
-		var line := serial_receive_buffer.substr(0, newline_index).strip_edges()
-		serial_receive_buffer = serial_receive_buffer.substr(newline_index + 1)
-		if line.begins_with("RX,"):
-			if not ble_link_ready:
-				ble_link_ready = true
-				send_button.disabled = false
-				_set_status("MG24とBLE接続済み。センサーデータを受信中です。")
-				_log("C6からMG24の受信データが届きました。")
-			notifications_received += 1
-			_update_stats()
-			_handle_serial_message(line.trim_prefix("RX,"))
-		elif line.contains("BLE subscribed; bidirectional GATT ready"):
+		if newline_index - consumed > MAX_SERIAL_LINE_BYTES:
+			_log("シリアル受信行が長すぎるため破棄しました。")
+		else:
+			var line := serial_receive_buffer.slice(consumed, newline_index).get_string_from_utf8().strip_edges()
+			_handle_serial_line(line)
+		consumed = newline_index + 1
+	serial_receive_buffer = serial_receive_buffer.slice(consumed)
+	if serial_receive_buffer.size() > MAX_SERIAL_LINE_BYTES:
+		serial_receive_buffer.clear()
+		discarding_serial_line = true
+		_log("シリアル受信行が長すぎるため破棄しました。")
+
+
+func _handle_serial_line(line: String) -> void:
+	if line.begins_with("RX,"):
+		if not ble_link_ready:
 			ble_link_ready = true
 			send_button.disabled = false
 			_set_status("MG24とBLE接続済み。センサーデータを受信中です。")
-			_log("C6とMG24の双方向BLEリンクが確立しました。")
-		elif line.contains("GATT disconnect event") or line.contains("BLE disconnected; will rescan"):
-			ble_link_ready = false
-			send_button.disabled = true
-			_set_status("MG24とのBLE切断。C6が再接続しています…")
-		elif line.begins_with("ERROR,") or line.begins_with("WARNING,"):
-			_log("C6: " + line)
+			_log("C6からMG24の受信データが届きました。")
+		notifications_received += 1
+		_update_stats()
+		_handle_serial_message(line.trim_prefix("RX,"))
+	elif line.contains("BLE subscribed; bidirectional GATT ready"):
+		ble_link_ready = true
+		send_button.disabled = false
+		_set_status("MG24とBLE接続済み。センサーデータを受信中です。")
+		_log("C6とMG24の双方向BLEリンクが確立しました。")
+	elif line.contains("GATT disconnect event") or line.contains("BLE disconnected; will rescan"):
+		ble_link_ready = false
+		send_button.disabled = true
+		_set_status("MG24とのBLE切断。C6が再接続しています…")
+	elif line.begins_with("ERROR,") or line.begins_with("WARNING,"):
+		_log("C6: " + line)
 
 
 func _send_command() -> void:
 	if not connected_to_device or not ble_link_ready or serial_stdio == null:
 		_log("C6のシリアル接続とMG24とのBLEリンク確立後に送信してください。")
 		return
+	# CMD行をC6の標準入力へ書き、C6側がBLE Write Without ResponseでMG24へ届ける。
 	var command := command_select.get_item_text(command_select.selected)
 	serial_stdio.store_string("CMD,%s\n" % command)
 	serial_stdio.flush()
@@ -358,7 +390,8 @@ func _set_connected(is_connected: bool) -> void:
 
 	if not is_connected:
 		ble_link_ready = false
-		serial_receive_buffer = ""
+		serial_receive_buffer.clear()
+		discarding_serial_line = false
 		last_sensor_timestamp = -1
 		integrated_yaw = 0.0
 		target_model_rotation = Quaternion.IDENTITY
@@ -374,6 +407,7 @@ func _set_status(message: String) -> void:
 
 func _handle_serial_message(message: String) -> void:
 	if message.begins_with("DATA,"):
+		# DATA,timestamp,ax,ay,az,gx,gy,gz の順に受け取り、表示と姿勢推定に使う。
 		if not _update_telemetry(message):
 			return
 		messages_received += 1
@@ -407,7 +441,7 @@ func _update_telemetry(message: String) -> bool:
 		if not fields[index].is_valid_float() or not is_finite(fields[index].to_float()):
 			_log("数値が不正なセンサーデータを受信しました: %s" % message)
 			return false
-	telemetry_label.text = "センサー (仮データ)  ax=%s ay=%s az=%s  gx=%s gy=%s gz=%s" % [
+	telemetry_label.text = "センサー (加速度g / 角速度°/秒)  ax=%s ay=%s az=%s  gx=%s gy=%s gz=%s" % [
 		fields[2], fields[3], fields[4], fields[5], fields[6], fields[7]
 	]
 	_update_model_from_sensor(fields)
@@ -430,7 +464,7 @@ func _update_model_from_sensor(fields: PackedStringArray) -> void:
 	if last_sensor_timestamp >= 0:
 		elapsed_ms = (sensor_time - last_sensor_timestamp + 4294967296) % 4294967296
 	else:
-		# 初回サンプルは最初の100ms間の動きを表す。
+		# 初回は送信側が報告した1周期（現在20 ms）だけ角速度を積分する。
 		elapsed_ms = sensor_time
 	if elapsed_ms > 0 and elapsed_ms <= 1000:
 		integrated_yaw += deg_to_rad(gyro_z) * float(elapsed_ms) / 1000.0

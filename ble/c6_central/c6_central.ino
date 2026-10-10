@@ -1,5 +1,7 @@
-// 処理の流れ: BLE広告からMG24を探して接続し、GATT通知を購読する。
-// DATA/ACKはprintfでPCへ流し、PCからのCMDはBLE経由でMG24へ転送する。
+// PCへのデータ経路:
+//   MG24のアドバタイズをサービスUUIDで検索 -> GATT接続 -> サービス/特性を探索
+//   -> Notificationを購読 -> MG24のDATA/ACK通知を「RX,」付きでUSBシリアルへ出力
+// Godotはこのシリアルを読み取る。逆方向のCMD行はUSBシリアルから読み、BLE書き込みでMG24へ渡す。
 #include <Arduino.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLEClient.h>
@@ -14,6 +16,8 @@ constexpr char kDeviceName[] = "KosenBall";
 constexpr char kServiceUuid[] = "4880c12c-fdcb-4077-8920-a450d7f9b907";
 constexpr char kDataCharacteristicUuid[] =
     "fec26ec4-6d71-4442-9f81-55bc21d658d6";
+// LFまで複数の通知を蓄積する。終端NULを除き1行1023 bytesまで受信可能。
+constexpr size_t NOTIFICATION_LINE_CAPACITY = 1024;
 
 BLEScan *scanner = nullptr;
 BLEClient *client = nullptr;
@@ -26,6 +30,9 @@ bool initialCommandSent = false;
 unsigned long connectedAtMs = 0;
 char serialCommand[48];
 size_t serialCommandLength = 0;
+char notificationLine[NOTIFICATION_LINE_CAPACITY];
+size_t notificationLineLength = 0;
+bool discardingNotificationLine = false;
 
 class CentralClientCallbacks final : public BLEClientCallbacks {
 public:
@@ -46,15 +53,36 @@ void notifyCallback(BLERemoteCharacteristic *characteristic, uint8_t *data,
                     size_t length, bool isNotify) {
   (void)characteristic;
   (void)isNotify;
-  printf("RX,%.*s", static_cast<int>(length),
-         reinterpret_cast<const char *>(data));
-  if (length == 0 || data[length - 1] != '\n') {
-    printf("\n");
+  // MTU 23なら1通知は20 bytes。通知境界に改行を足さず、MG24のLFまで
+  // 蓄積してからRX,を付ける。Godotは完全なDATA/ACK行だけを受け取る。
+  for (size_t index = 0; index < length; ++index) {
+    const char incoming = static_cast<char>(data[index]);
+    if (incoming == '\r') {
+      continue;
+    }
+    if (incoming == '\n') {
+      if (!discardingNotificationLine && notificationLineLength > 0) {
+        notificationLine[notificationLineLength] = '\0';
+        printf("RX,%s\n", notificationLine);
+      }
+      notificationLineLength = 0;
+      discardingNotificationLine = false;
+    } else if (!discardingNotificationLine) {
+      if (notificationLineLength < sizeof(notificationLine) - 1) {
+        notificationLine[notificationLineLength++] = incoming;
+      } else {
+        notificationLineLength = 0;
+        discardingNotificationLine = true;
+        printf("ERROR,BLE notification line too long\n");
+      }
+    }
   }
 }
 
 bool scanForPeripheral() {
+  // MG24はKosenBallという名前とセンサーサービスUUIDを含むアドバタイズを送信する。
   printf("BLE scanning for %s\n", kDeviceName);
+  peerFound = false;
   scanner->clearResults();
   BLEScanResults *results = scanner->start(3, false);
   if (results == nullptr) {
@@ -68,9 +96,8 @@ bool scanForPeripheral() {
     const bool matchingService =
         device.haveServiceUUID() &&
         device.isAdvertisingService(BLEUUID(kServiceUuid));
-    const bool matchingName = device.haveName() &&
-                              device.getName().equals(kDeviceName);
-    if (!matchingService && !matchingName) {
+    // 同名の旧ファームウェアを選ばないよう、センサーサービスを必須とする。
+    if (!matchingService) {
       continue;
     }
 
@@ -108,19 +135,20 @@ bool connectToPeripheral() {
     return false;
   }
 
-  connected = true;
   connectedAtMs = millis();
-  printf("BLE connected; MG24 requests 7.5 ms interval\n");
-  if (!client->setMTU(247)) {
-    printf("WARNING,BLE MTU 247 request failed\n");
-  }
+  // MTUはBLEDevice::setMTU()で設定済み。接続処理がMTU交換を行う。
+  printf("BLE connected; negotiated MTU=%u\n",
+         static_cast<unsigned>(client->getMTU()));
 
+  // 接続後にMG24のサービスとデータ特性を見つけ、双方向通信の機能を確認する。
   printf("GATT service discovery starting\n");
   BLERemoteService *service = client->getService(BLEUUID(kServiceUuid));
   printf("GATT service discovery finished: %s\n",
          service == nullptr ? "not found" : "found");
   if (service == nullptr) {
-    printf("ERROR,sensor service not found\n");
+    printf("ERROR,%s\n", client->isConnected()
+                              ? "sensor service not found"
+                              : "BLE disconnected during service discovery");
     client->disconnect();
     connected = false;
     return false;
@@ -136,7 +164,15 @@ bool connectToPeripheral() {
     return false;
   }
 
+  // 購読完了をMG24が受け取ると、MG24側の20ms周期DATA送信が始まる。
+  notificationLineLength = 0;
+  discardingNotificationLine = false;
   dataCharacteristic->registerForNotify(notifyCallback, true, true);
+  if (!client->isConnected()) {
+    printf("ERROR,BLE disconnected during notification subscription\n");
+    return false;
+  }
+  connected = true;
   printf("BLE subscribed; bidirectional GATT ready\n");
   return true;
 }
@@ -164,6 +200,7 @@ void sendCommand(const char *command, size_t length) {
 }
 
 void pollSerialCommands() {
+  // GodotがUSBシリアルへ書いた改行区切りCMDを1行ずつBLEへ転送する。
   while (Serial.available() > 0) {
     const int incoming = Serial.read();
     if (incoming < 0 || incoming == '\r') {
@@ -201,7 +238,7 @@ void setup() {
 }
 
 void loop() {
-  if (client != nullptr && !client->isConnected()) {
+  if (client != nullptr && (!connected || !client->isConnected())) {
     connected = false;
     dataCharacteristic = nullptr;
     delete client;
@@ -212,6 +249,7 @@ void loop() {
   }
 
   if (!connected) {
+    // 切断中は再スキャンし、見つけたMG24への接続と通知購読をやり直す。
     if (!scanForPeripheral()) {
       delay(250);
       return;
