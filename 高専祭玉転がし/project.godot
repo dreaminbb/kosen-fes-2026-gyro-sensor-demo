@@ -17,12 +17,16 @@ config/icon="res://icon.svg"
 
 [display]
 
-window/size/viewport_height=864
+window/size/viewport_width=1600
+window/size/viewport_height=900
+window/size/mode=3
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
 
 [physics]
 
+common/physics_ticks_per_second=120
+common/physics_interpolation=true
 3d/physics_engine="Jolt Physics"
 
 [rendering]

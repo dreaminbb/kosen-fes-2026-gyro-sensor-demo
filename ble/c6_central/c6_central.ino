@@ -164,7 +164,7 @@ bool connectToPeripheral() {
     return false;
   }
 
-  // 購読完了をMG24が受け取ると、MG24側の20ms周期DATA送信が始まる。
+  // 購読完了をMG24が受け取ると、MG24側の10ms周期DATA送信が始まる。
   notificationLineLength = 0;
   discardingNotificationLine = false;
   dataCharacteristic->registerForNotify(notifyCallback, true, true);
@@ -226,6 +226,8 @@ void pollSerialCommands() {
 
 void setup() {
   Serial.begin(115200);
+  // 完成したRX行をstdioのバッファに留めず、すぐUSBへ渡す。
+  setvbuf(stdout, nullptr, _IONBF, 0);
   delay(300);
   printf("BOOT,C6 BLE central\n");
 

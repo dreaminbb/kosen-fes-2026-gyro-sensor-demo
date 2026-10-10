@@ -1,7 +1,7 @@
 // PCへの送信経路:
 //   MG24がGATTサービス/特性を用意してアドバタイズ ->
 //   C6が発見・接続して通知を購読
-//   -> 購読開始後、MG24が実センサー値をDATA行にして20msごとに通知
+//   -> 購読開始後、MG24が実センサー値をDATA行にして10msごとに通知
 //   -> C6が通知をUSBシリアルへ転送 -> Godotがシリアル行を解析して画面を更新
 // 逆方向はGodotのCMD行をC6がBLE Write Without
 // ResponseでMG24へ転送し、ACKを通知する。
@@ -11,23 +11,24 @@
 #include <Arduino.h>
 #include <LSM6DS3.h>
 #include <Wire.h>
+#include <atomic>
+#include <queue.h>
 #include <sl_bluetooth.h>
 #include <sl_bt_api.h>
 #include <stdio.h>
 #include <string.h>
-#include <atomic>
-#include <queue.h>
+
+#define SENSOR_POLL_INTERVAL_MS 5
 
 namespace {
-
 // BLEイベントタスクのスタックは1000 bytes。浮動小数点のprintfや
 // コマンド処理をそこで実行するとスタックを使い切るため、Arduinoタスクへ渡す。
 constexpr size_t BLE_EVENT_QUEUE_LENGTH = 16;
 StaticQueue_t bleEventQueueControl;
 uint8_t bleEventQueueStorage[BLE_EVENT_QUEUE_LENGTH * sizeof(sl_bt_msg_t)];
-QueueHandle_t bleEventQueue = xQueueCreateStatic(
-    BLE_EVENT_QUEUE_LENGTH, sizeof(sl_bt_msg_t), bleEventQueueStorage,
-    &bleEventQueueControl);
+QueueHandle_t bleEventQueue =
+    xQueueCreateStatic(BLE_EVENT_QUEUE_LENGTH, sizeof(sl_bt_msg_t),
+                       bleEventQueueStorage, &bleEventQueueControl);
 std::atomic<bool> bleEventQueueOverflow{false};
 
 const uint8_t advertisedName[] = "KosenBall";
@@ -38,8 +39,9 @@ const uint8_t nameScanResponse[] = {0x0a, 0x09, 'K', 'o', 's', 'e',
                                     'n',  'B',  'a', 'l', 'l'};
 const uint16_t gattValueMaxLength = 250;
 const uint16_t defaultNotificationPayloadSize = 20;
-// 実センサーを50 Hzで送信する。sample.hのテスト列（100 ms）とは独立した周期。
-constexpr unsigned long SENSOR_SEND_INTERVAL_MS = 20;
+// 実センサーを100 Hzで送信する。IMU内部は416 Hz、BLE接続間隔は7.5 ms。
+// sample.hのテスト列（100 ms）とは独立した周期。
+constexpr unsigned long SENSOR_SEND_INTERVAL_MS = 10;
 constexpr unsigned long SENSOR_LOG_INTERVAL_MS = 1000;
 
 const uuid_128 sppServiceUuid = {.data = {0x07, 0xb9, 0xf9, 0xd7, 0x50, 0xa4,
@@ -75,7 +77,7 @@ SensorData fetchSensorData() {
   // 1送信周期ごとに6軸を読み取り、BLE通知用の値として返す。
   return SensorData{myIMU.readFloatAccelX(), myIMU.readFloatAccelY(),
                     myIMU.readFloatAccelZ(), myIMU.readFloatGyroX(),
-                    myIMU.readFloatGyroY(), myIMU.readFloatGyroZ()};
+                    myIMU.readFloatGyroY(),  myIMU.readFloatGyroZ()};
 }
 
 char commandBuffer[64];
@@ -225,17 +227,17 @@ bool sendNotificationText(const char *message) {
   return true;
 }
 
-SensorData sampleData(int loopIndex) {
-  if (loopIndex < 0 || loopIndex >= SAMPLE_DATA_LENGTH) {
-    loopIndex %= SAMPLE_DATA_LENGTH;
-    if (loopIndex < 0) {
-      loopIndex += SAMPLE_DATA_LENGTH;
-    }
-  }
-
-  Serial.printf("サンプルデータのインデックス: %d\n", loopIndex);
-  return rightTurn360Samples[loopIndex];
-}
+// SensorData sampleData(int loopIndex) {
+//   if (loopIndex < 0 || loopIndex >= SAMPLE_DATA_LENGTH) {
+//     loopIndex %= SAMPLE_DATA_LENGTH;
+//     if (loopIndex < 0) {
+//       loopIndex += SAMPLE_DATA_LENGTH;
+//     }
+//   }
+//
+//   Serial.printf("サンプルデータのインデックス: %d\n", loopIndex);
+//   return rightTurn360Samples[loopIndex];
+// }
 
 void processCommand(const char *command) {
   Serial.printf("BLE受信コマンド: %s\n", command);
@@ -322,9 +324,15 @@ void loop() {
 
   // 接続しただけでは送らず、C6がCCCDで通知購読を有効にした後に送信する。
   if (now - lastSensorSendMs >= SENSOR_SEND_INTERVAL_MS) {
-    lastSensorSendMs = now;
+    // 基準時刻へ周期を足し、loopの1 ms待機による遅れを次回へ積み上げない。
+    // 長い停止の後は取り戻すための連続送信をせず、最新サンプルだけ送る。
+    lastSensorSendMs += SENSOR_SEND_INTERVAL_MS;
+    if (now - lastSensorSendMs >= SENSOR_SEND_INTERVAL_MS) {
+      lastSensorSendMs = now;
+    }
     if (!sessionClockStarted) {
-      // 初回サンプルの経過時刻を1周期（20 ms）とし、以降は実際の経過時間を送る。
+      // 初回サンプルの経過時刻を1周期（10
+      // ms）とし、以降は実際の経過時間を送る。
       sessionStartedMs = now - SENSOR_SEND_INTERVAL_MS;
       sessionClockStarted = true;
     }
@@ -353,7 +361,7 @@ void loop() {
     monitoringIndex = (monitoringIndex + 1) % SAMPLE_DATA_LENGTH;
   }
 
-  delay(1);
+  delay(SENSOR_POLL_INTERVAL_MS);
 }
 
 // Bluetoothのイベントタスクから呼ばれる。イベントのポインターはコールバック
@@ -416,9 +424,9 @@ void handleBleEvent(sl_bt_msg_t *event) {
 
   case sl_bt_evt_connection_closed_id:
     // 接続に紐づく状態やコマンド途中の内容を初期化し、次のC6接続に備えてアドバタイズを再開する。
-    Serial.printf("BLE central disconnected: reason=0x%04X\n",
-                  static_cast<unsigned>(
-                      event->data.evt_connection_closed.reason));
+    Serial.printf(
+        "BLE central disconnected: reason=0x%04X\n",
+        static_cast<unsigned>(event->data.evt_connection_closed.reason));
     connectionHandle = SL_BT_INVALID_CONNECTION_HANDLE;
     notificationsEnabled = false;
     streamingEnabled = true;
