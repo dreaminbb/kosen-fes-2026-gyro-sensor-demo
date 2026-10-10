@@ -10,7 +10,7 @@ const BALL_DROP_HEIGHT := 1.8
 const FALL_HEIGHT := -3.0
 const MAX_TILT_DEGREES := 18.0
 # 時定数約21 ms。50 Hz・係数16/秒だった台の追従遅れを短縮する。
-const ROTATION_SMOOTHING_RATE := 48.0
+const ROTATION_SMOOTHING_RATE := 20.0
 const START_POSITION := Vector3(0.0, 0.0, 24.0)
 const GOAL_POSITION := Vector3(0.0, 0.0, -26.0)
 const CHECKPOINTS := [
@@ -218,7 +218,7 @@ func _create_platform() -> void:
 		_add_bumper(offset)
 	# 床の細線は装飾だけで、球の走行を妨げない。
 	for z_position in range(-27, 28):
-		if z_position > -25 and z_position < -10:
+		if z_position >= -25 and z_position <= -3:
 			continue
 		var line_width := 2.2 if z_position < -10 else 7.8
 		_add_box(platform, Vector3(line_width, 0.006, 0.018), Vector3(0.0, 0.105, z_position), MOCHA_SURFACE_2)

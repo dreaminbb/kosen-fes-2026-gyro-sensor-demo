@@ -69,7 +69,6 @@ var connection_panel: PanelContainer
 var connection_panel_button: Button
 var connection_status_label: Label
 var telemetry_detail_label: Label
-var control_hint_label: Label
 
 
 func _ready() -> void:
@@ -93,7 +92,6 @@ func _physics_process(_delta: float) -> void:
 	var focus := get_viewport().gui_get_focus_owner()
 	ball_game.keyboard_enabled = not sensor_fresh and not (focus is LineEdit)
 	ball_game.set_sensor_angular_velocity(sensor_angular_velocity if sensor_fresh else Vector3.ZERO)
-	control_hint_label.text = "BLEコントローラーを傾けて操作" if sensor_fresh else "方向キーで操作  ·  進行方向：画面奥"
 	if not sensor_fresh and focus is LineEdit:
 		ball_game.set_target_tilt(0.0, 0.0)
 
@@ -229,16 +227,6 @@ func _build_ui() -> void:
 	telemetry_detail_label.add_theme_font_size_override("font_size", 11)
 	telemetry_detail_label.add_theme_color_override("font_color", MOCHA_OVERLAY_0)
 	sensor_layout.add_child(telemetry_detail_label)
-
-	var help_chip := _make_game_panel("ControlHint")
-	_set_panel_rect(help_chip, 0.5, 1.0, 0.5, 1.0, Vector4(-238, -64, 238, -20))
-	control_hint_label = Label.new()
-	control_hint_label.text = "方向キーで操作  ·  進行方向：画面奥"
-	control_hint_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	control_hint_label.add_theme_color_override("font_color", MOCHA_YELLOW)
-	control_hint_label.add_theme_font_size_override("font_size", 13)
-	help_chip.add_child(control_hint_label)
-	overlay.add_child(help_chip)
 
 	connection_panel = _make_game_panel("ConnectionSettings")
 	_set_panel_rect(connection_panel, 1.0, 0.0, 1.0, 0.0, Vector4(-426, 154, -24, 548))

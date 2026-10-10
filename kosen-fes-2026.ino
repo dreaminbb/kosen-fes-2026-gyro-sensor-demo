@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define SENSOR_POLL_INTERVAL_MS 5
+#define SENSOR_POLL_INTERVAL_MS 0
 
 namespace {
 // BLEイベントタスクのスタックは1000 bytes。浮動小数点のprintfや
