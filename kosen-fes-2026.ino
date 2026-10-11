@@ -1,12 +1,10 @@
 // PCへの送信経路:
 //   MG24がGATTサービス/特性を用意してアドバタイズ ->
 //   C6が発見・接続して通知を購読
-//   -> 購読開始後、MG24が実センサー値をDATA行にして2msごとに通知
+//   -> 購読開始後、MG24が実センサー値をDATA行にして10msごとに通知
 //   -> C6が通知をUSBシリアルへ転送 -> Godotがシリアル行を解析して画面を更新
 // 逆方向はGodotのCMD行をC6がBLE Write Without
 // ResponseでMG24へ転送し、ACKを通知する。
-#include "sample.h"
-
 #include "arduino_serial_config.h"
 #include <Arduino.h>
 #include <LSM6DS3.h>
@@ -20,6 +18,15 @@
 
 #define SENSOR_POLL_INTERVAL_MS 0
 #define SENSOR_THRESHOLD_ACCEL 0.1f
+
+struct SensorData {
+  float accelX;
+  float accelY;
+  float accelZ;
+  float gyroX;
+  float gyroY;
+  float gyroZ;
+};
 
 namespace {
 // BLEイベントタスクのスタックは1000 bytes。浮動小数点のprintfや
@@ -40,10 +47,9 @@ const uint8_t nameScanResponse[] = {0x0a, 0x09, 'K', 'o', 's', 'e',
                                     'n',  'B',  'a', 'l', 'l'};
 const uint16_t gattValueMaxLength = 250;
 const uint16_t defaultNotificationPayloadSize = 20;
-// IMUを833 Hzで動作させ、実センサー値を500 Hz（2 ms）でBLE送信する。
-// sample.hのテスト列（100 ms）とは独立した周期。
-constexpr unsigned long SENSOR_SEND_INTERVAL_US = 2000;
-constexpr unsigned long SENSOR_LOG_INTERVAL_MS = 1000;
+// IMUは833 Hzで更新し、Godotの物理更新に近い100 Hzで最新値を送る。
+constexpr unsigned long SENSOR_SEND_INTERVAL_US = 10000;
+constexpr unsigned long NOTIFICATION_RETRY_INTERVAL_US = 5000;
 
 const uuid_128 sppServiceUuid = {.data = {0x07, 0xb9, 0xf9, 0xd7, 0x50, 0xa4,
                                           0x20, 0x89, 0x77, 0x40, 0xcb, 0xfd,
@@ -65,17 +71,22 @@ bool advertisingSetInitialized = false;
 bool notificationsEnabled = false;
 bool streamingEnabled = true;
 bool sessionClockStarted = false;
-int monitoringIndex = 0;
 unsigned long sessionStartedUs = 0;
 unsigned long lastSensorSendUs = 0;
-unsigned long lastSensorLogMs = 0;
+char pendingNotification[128];
+size_t pendingNotificationLength = 0;
+size_t pendingNotificationOffset = 0;
+bool pendingNotificationIsControl = false;
+char queuedControlNotification[20];
+size_t queuedControlNotificationLength = 0;
+unsigned long nextNotificationAttemptUs = 0;
 
 // 加速度センサーのインスタンス
 LSM6DS3 myIMU(I2C_MODE, 0x6A);
 bool imuReady = false;
 
 SensorData fetchSensorData() {
-  // 各軸を一度ずつ読み、重複したI2C読み出しを避けて500 Hzを保つ。
+  // 各軸を一度ずつ読み、I2C読み出しの重複を避ける。
   const float accelX = myIMU.readFloatAccelX();
   const float accelY = myIMU.readFloatAccelY();
   const float accelZ = myIMU.readFloatAccelZ();
@@ -210,43 +221,81 @@ bool startAdvertising() {
   return true;
 }
 
-bool sendNotificationText(const char *message) {
+bool sendNotificationText(const char *message, bool isControl = false) {
   if (!notificationsEnabled ||
       connectionHandle == SL_BT_INVALID_CONNECTION_HANDLE) {
     return false;
   }
 
-  // MTUの通知ペイロード上限を超えるメッセージは、上限サイズごとに分割して送る。
   const size_t messageLength = strlen(message);
-  size_t offset = 0;
-  while (offset < messageLength) {
-    const size_t remaining = messageLength - offset;
-    const size_t chunkLength = remaining < notificationPayloadSize
-                                   ? remaining
-                                   : notificationPayloadSize;
-    const sl_status_t status = sl_bt_gatt_server_send_notification(
-        connectionHandle, sensorDataCharacteristicHandle,
-        static_cast<uint8_t>(chunkLength),
-        reinterpret_cast<const uint8_t *>(message + offset));
-    if (!reportBleStatus("send BLE notification", status)) {
+  if (messageLength == 0 || messageLength > sizeof(pendingNotification)) {
+    return false;
+  }
+  if (isControl && pendingNotificationLength > 0 &&
+      pendingNotificationOffset > 0) {
+    if (messageLength > sizeof(queuedControlNotification)) {
       return false;
     }
-    offset += chunkLength;
+    memcpy(queuedControlNotification, message, messageLength);
+    queuedControlNotificationLength = messageLength;
+    return true;
   }
+  if (pendingNotificationLength > 0 &&
+      (pendingNotificationOffset > 0 || pendingNotificationIsControl ||
+       queuedControlNotificationLength > 0)) {
+    return false;
+  }
+  if (pendingNotificationLength == 0) {
+    nextNotificationAttemptUs = micros();
+  }
+  // 未送信のDATAだけを最新値で置き換える。分割送信済みの行は最後まで送る。
+  memcpy(pendingNotification, message, messageLength);
+  pendingNotificationLength = messageLength;
+  pendingNotificationOffset = 0;
+  pendingNotificationIsControl = isControl;
   return true;
 }
 
-// SensorData sampleData(int loopIndex) {
-//   if (loopIndex < 0 || loopIndex >= SAMPLE_DATA_LENGTH) {
-//     loopIndex %= SAMPLE_DATA_LENGTH;
-//     if (loopIndex < 0) {
-//       loopIndex += SAMPLE_DATA_LENGTH;
-//     }
-//   }
-//
-//   Serial.printf("サンプルデータのインデックス: %d\n", loopIndex);
-//   return rightTurn360Samples[loopIndex];
-// }
+void flushNotification(unsigned long nowUs) {
+  if (!notificationsEnabled ||
+      connectionHandle == SL_BT_INVALID_CONNECTION_HANDLE ||
+      pendingNotificationLength == 0 ||
+      static_cast<int32_t>(nowUs - nextNotificationAttemptUs) < 0) {
+    return;
+  }
+
+  const size_t remaining = pendingNotificationLength - pendingNotificationOffset;
+  const size_t chunkLength = remaining < notificationPayloadSize
+                                 ? remaining
+                                 : notificationPayloadSize;
+  const sl_status_t status = sl_bt_gatt_server_send_notification(
+      connectionHandle, sensorDataCharacteristicHandle, chunkLength,
+      reinterpret_cast<const uint8_t *>(pendingNotification +
+                                        pendingNotificationOffset));
+  if (status == SL_STATUS_NO_MORE_RESOURCE) {
+    nextNotificationAttemptUs = nowUs + NOTIFICATION_RETRY_INTERVAL_US;
+    return;
+  }
+  if (!reportBleStatus("send BLE notification", status)) {
+    pendingNotificationLength = 0;
+    pendingNotificationOffset = 0;
+    queuedControlNotificationLength = 0;
+    return;
+  }
+  pendingNotificationOffset += chunkLength;
+  nextNotificationAttemptUs = nowUs;
+  if (pendingNotificationOffset == pendingNotificationLength) {
+    pendingNotificationLength = 0;
+    pendingNotificationOffset = 0;
+    if (queuedControlNotificationLength > 0) {
+      memcpy(pendingNotification, queuedControlNotification,
+             queuedControlNotificationLength);
+      pendingNotificationLength = queuedControlNotificationLength;
+      queuedControlNotificationLength = 0;
+      pendingNotificationIsControl = true;
+    }
+  }
+}
 
 void processCommand(const char *command) {
   Serial.printf("BLE受信コマンド: %s\n", command);
@@ -259,13 +308,12 @@ void processCommand(const char *command) {
     streamingEnabled = false;
     response = "ACK,STOP\n";
   } else if (strcmp(command, "CMD,RESET") == 0) {
-    monitoringIndex = 0;
     sessionClockStarted = false;
     streamingEnabled = true;
     response = "ACK,RESET\n";
   }
 
-  sendNotificationText(response);
+  sendNotificationText(response, true);
 }
 
 void processCommandByte(uint8_t byte) {
@@ -311,7 +359,8 @@ void setup() {
   myIMU.settings.accelBandWidth = 400;
   imuReady = myIMU.begin() == 0;
   if (imuReady) {
-    Wire1.setClock(400000);
+    // LSM6DS3ライブラリのI2C_MODEはWireを使用する。
+    Wire.setClock(400000);
     Serial.print("LSM6DS3 initialized\n");
   } else {
     Serial.print("ERROR: LSM6DS3 initialization failed\n");
@@ -329,9 +378,9 @@ void loop() {
     Serial.print("ERROR: BLE event queue overflow\n");
   }
 
-  const unsigned long nowMs = millis();
   const unsigned long nowUs = micros();
   if (!imuReady || !notificationsEnabled || !streamingEnabled) {
+    flushNotification(nowUs);
     delay(1);
     return;
   }
@@ -343,36 +392,34 @@ void loop() {
     if (nowUs - lastSensorSendUs >= SENSOR_SEND_INTERVAL_US) {
       lastSensorSendUs = nowUs;
     }
-    // const SensorData data = sampleData(monitoringIndex);
-    const SensorData data = fetchSensorData();
-    const unsigned long sampleTimeUs = micros();
-    if (!sessionClockStarted) {
-      // 初回サンプル時刻を1周期前とし、以降はマイクロ秒単位で送る。
-      sessionStartedUs = sampleTimeUs - SENSOR_SEND_INTERVAL_US;
-      sessionClockStarted = true;
-    }
-    const unsigned long elapsedUs = sampleTimeUs - sessionStartedUs;
-    char message[128];
-    const int messageLength = snprintf(
-        message, sizeof(message), "DATA,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-        elapsedUs, data.accelX, data.accelY, data.accelZ, data.gyroX,
-        data.gyroY, data.gyroZ);
-
-    if (messageLength > 0 &&
-        static_cast<size_t>(messageLength) < sizeof(message)) {
-      // シリアル出力でサンプリングを待たせないよう、通常ログは1秒に1回に制限する。
-      if (sendNotificationText(message) &&
-          nowMs - lastSensorLogMs >= SENSOR_LOG_INTERVAL_MS) {
-        lastSensorLogMs = nowMs;
-        Serial.printf("BLE送信: %s", message);
+    // 既に行の一部を送信中、または制御応答を待機中なら読み出しを省く。
+    if (pendingNotificationLength == 0 ||
+        (pendingNotificationOffset == 0 && !pendingNotificationIsControl &&
+         queuedControlNotificationLength == 0)) {
+      const SensorData data = fetchSensorData();
+      const unsigned long sampleTimeUs = micros();
+      if (!sessionClockStarted) {
+        // 初回サンプル時刻を1周期前とし、以降はマイクロ秒単位で送る。
+        sessionStartedUs = sampleTimeUs - SENSOR_SEND_INTERVAL_US;
+        sessionClockStarted = true;
       }
-    } else {
-      Serial.print("ERROR: センサーデータの整形に失敗しました\n");
-    }
+      const unsigned long elapsedUs = sampleTimeUs - sessionStartedUs;
+      char message[128];
+      const int messageLength = snprintf(
+          message, sizeof(message), "DATA,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+          elapsedUs, data.accelX, data.accelY, data.accelZ, data.gyroX,
+          data.gyroY, data.gyroZ);
 
-    monitoringIndex = (monitoringIndex + 1) % SAMPLE_DATA_LENGTH;
+      if (messageLength > 0 &&
+          static_cast<size_t>(messageLength) < sizeof(message)) {
+        sendNotificationText(message);
+      } else {
+        Serial.print("ERROR: センサーデータの整形に失敗しました\n");
+      }
+    }
   }
 
+  flushNotification(micros());
   delay(SENSOR_POLL_INTERVAL_MS);
 }
 
@@ -414,8 +461,10 @@ void handleBleEvent(sl_bt_msg_t *event) {
     // MTUは接続ごとに交渉する。前の接続の大きなペイロード上限を引き継がない。
     notificationPayloadSize = defaultNotificationPayloadSize;
     notificationsEnabled = false;
+    pendingNotificationLength = 0;
+    pendingNotificationOffset = 0;
+    queuedControlNotificationLength = 0;
     streamingEnabled = true;
-    monitoringIndex = 0;
     sessionClockStarted = false;
     Serial.print("BLE central connected; requesting 7.5 ms interval\n");
     reportBleStatus("request 7.5 ms BLE interval",
@@ -441,8 +490,10 @@ void handleBleEvent(sl_bt_msg_t *event) {
         static_cast<unsigned>(event->data.evt_connection_closed.reason));
     connectionHandle = SL_BT_INVALID_CONNECTION_HANDLE;
     notificationsEnabled = false;
+    pendingNotificationLength = 0;
+    pendingNotificationOffset = 0;
+    queuedControlNotificationLength = 0;
     streamingEnabled = true;
-    monitoringIndex = 0;
     sessionClockStarted = false;
     commandLength = 0;
     startAdvertising();
@@ -466,17 +517,23 @@ void handleBleEvent(sl_bt_msg_t *event) {
     // C6がデータ特性の通知購読を有効/無効にした状態変化を反映する。
     const sl_bt_evt_gatt_server_characteristic_status_t &status =
         event->data.evt_gatt_server_characteristic_status;
-    if (status.characteristic == sensorDataCharacteristicHandle &&
+    if (status.connection == connectionHandle &&
+        status.characteristic == sensorDataCharacteristicHandle &&
         status.status_flags == sl_bt_gatt_server_client_config) {
       notificationsEnabled =
           status.client_config_flags == sl_bt_gatt_server_notification;
       if (notificationsEnabled) {
         // C6の通知購読が有効になった時点から、loop()がDATA行を送り始める。
-        monitoringIndex = 0;
         sessionClockStarted = false;
         lastSensorSendUs = micros();
         Serial.print("BLE notifications enabled; streaming sensor data\n");
+        if (!imuReady) {
+          sendNotificationText("ERROR,IMU_NOT_READY\n", true);
+        }
       } else {
+        pendingNotificationLength = 0;
+        pendingNotificationOffset = 0;
+        queuedControlNotificationLength = 0;
         Serial.print("BLE notifications disabled\n");
       }
     }

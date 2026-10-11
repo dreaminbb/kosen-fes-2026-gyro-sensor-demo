@@ -89,6 +89,13 @@ func _physics_process(_delta: float) -> void:
 	# 120 Hzの物理tickで受信を確認する。姿勢の反映は同じtick内。
 	_poll_serial()
 	var sensor_fresh := sensor_pose_available and Time.get_ticks_usec() - last_sensor_receive_usec < SENSOR_STALE_USEC
+	if ble_link_ready:
+		var link_text := "●  BLEデータ受信中" if sensor_fresh else "●  BLE接続済み・データ待ち"
+		if connection_status_label.text != link_text:
+			connection_status_label.text = link_text
+			connection_status_label.add_theme_color_override(
+				"font_color", MOCHA_GREEN if sensor_fresh else MOCHA_YELLOW
+			)
 	var focus := get_viewport().gui_get_focus_owner()
 	ball_game.keyboard_enabled = not sensor_fresh and not (focus is LineEdit)
 	ball_game.set_sensor_angular_velocity(sensor_angular_velocity if sensor_fresh else Vector3.ZERO)
@@ -585,22 +592,18 @@ func _ingest_serial_bytes(data: PackedByteArray) -> void:
 
 func _handle_serial_line(line: String) -> void:
 	if line.begins_with("RX,"):
-		if not ble_link_ready:
-			ble_link_ready = true
-			send_button.disabled = false
-			connection_status_label.text = "●  BLEデータ受信中"
-			connection_status_label.add_theme_color_override("font_color", MOCHA_GREEN)
-			_set_status("MG24とBLE接続済み。センサーデータを受信中です。")
-			_log("C6からMG24の受信データが届きました。")
 		notifications_received += 1
 		_handle_serial_message(line.trim_prefix("RX,"))
 	elif line.contains("BLE subscribed; bidirectional GATT ready"):
 		ble_link_ready = true
 		send_button.disabled = false
-		connection_status_label.text = "●  BLE接続済み"
-		connection_status_label.add_theme_color_override("font_color", MOCHA_GREEN)
-		_set_status("MG24とBLE接続済み。センサーデータを受信中です。")
+		connection_status_label.text = "●  BLE接続済み・データ待ち"
+		connection_status_label.add_theme_color_override("font_color", MOCHA_YELLOW)
+		_set_status("MG24とBLE接続済み。センサーデータ待機中です。")
 		_log("C6とMG24の双方向BLEリンクが確立しました。")
+	elif line.contains("BLE subscribed but no sensor DATA"):
+		_log(line)
+		_set_status("BLE接続後にDATAが届かず、C6が再接続しています。")
 	elif line.contains("GATT disconnect event") or line.contains("BLE disconnected; will rescan"):
 		ble_link_ready = false
 		send_button.disabled = true
@@ -659,8 +662,13 @@ func _set_status(message: String) -> void:
 func _handle_serial_message(message: String) -> void:
 	if message.begins_with("DATA,"):
 		# DATA,timestamp,ax,ay,az,gx,gy,gz の順に受け取り、表示と姿勢推定に使う。
+		var was_fresh := sensor_pose_available and Time.get_ticks_usec() - last_sensor_receive_usec < SENSOR_STALE_USEC
 		if not _update_telemetry(message):
 			return
+		ble_link_ready = true
+		send_button.disabled = false
+		if not was_fresh:
+			_set_status("MG24からセンサーデータを受信中です。")
 		messages_received += 1
 	elif message.begins_with("ACK,"):
 		var response := message.trim_prefix("ACK,")
@@ -671,6 +679,9 @@ func _handle_serial_message(message: String) -> void:
 			ball_game.reset_ball()
 		_log("MG24からの応答: %s" % response)
 		messages_received += 1
+	elif message.begins_with("ERROR,"):
+		_log("MG24からのエラー: %s" % message.trim_prefix("ERROR,"))
+		_set_status("MG24エラー: %s" % message.trim_prefix("ERROR,"))
 	else:
 		_log("未対応のC6シリアル行: %s" % message)
 
@@ -722,12 +733,12 @@ func _update_model_from_sensor(fields: PackedStringArray) -> void:
 	if last_sensor_timestamp >= 0:
 		elapsed_us = (sensor_time_us - last_sensor_timestamp + 4294967296) % 4294967296
 	else:
-		# 初回は送信側が報告した1周期（現在2 ms）だけ角速度を積分する。
+		# 初回は送信側が報告した1周期（現在10 ms）だけ角速度を積分する。
 		elapsed_us = sensor_time_us
 	if elapsed_us > 0 and elapsed_us <= 1000000:
 		integrated_yaw += deg_to_rad(gyro_z) * float(elapsed_us) / 1000000.0
 		var elapsed_ms := float(elapsed_us) / 1000.0
-		# 表示周期のちらつきだけ抑え、500 Hz付近の実受信周期を表示する。
+		# 表示周期のちらつきを抑えて、実際の受信周期を表示する。
 		sensor_period_ms = elapsed_ms if sensor_period_ms <= 0.0 else lerpf(sensor_period_ms, elapsed_ms, 0.05)
 	last_sensor_timestamp = sensor_time_us
 	last_sensor_receive_usec = Time.get_ticks_usec()

@@ -9,6 +9,8 @@
 #include <BLEScan.h>
 #include <BLERemoteCharacteristic.h>
 #include <BLERemoteService.h>
+#include <atomic>
+#include <string.h>
 
 namespace {
 
@@ -16,8 +18,10 @@ constexpr char kDeviceName[] = "KosenBall";
 constexpr char kServiceUuid[] = "4880c12c-fdcb-4077-8920-a450d7f9b907";
 constexpr char kDataCharacteristicUuid[] =
     "fec26ec4-6d71-4442-9f81-55bc21d658d6";
-// LFまで複数の通知を蓄積する。終端NULを除き1行1023 bytesまで受信可能。
-constexpr size_t NOTIFICATION_LINE_CAPACITY = 1024;
+// MG24の送信バッファは128 bytes。RX,接頭辞を含めても160 bytesで足りる。
+constexpr size_t NOTIFICATION_LINE_CAPACITY = 160;
+constexpr size_t SERIAL_FRAME_CAPACITY = 160;
+constexpr unsigned long DATA_TIMEOUT_MS = 2000;
 
 BLEScan *scanner = nullptr;
 BLEClient *client = nullptr;
@@ -27,23 +31,85 @@ uint8_t peerAddressType = 0;
 bool peerFound = false;
 bool connected = false;
 bool initialCommandSent = false;
+bool streamingExpected = true;
 unsigned long connectedAtMs = 0;
-char serialCommand[48];
+char serialCommand[16];
 size_t serialCommandLength = 0;
 char notificationLine[NOTIFICATION_LINE_CAPACITY];
 size_t notificationLineLength = 0;
 bool discardingNotificationLine = false;
+char pendingSerialFrame[SERIAL_FRAME_CAPACITY];
+size_t pendingSerialFrameLength = 0;
+bool pendingSerialFramePriority = false;
+char serialOutputFrame[SERIAL_FRAME_CAPACITY];
+size_t serialOutputFrameLength = 0;
+size_t serialOutputFrameOffset = 0;
+portMUX_TYPE serialFrameMux = portMUX_INITIALIZER_UNLOCKED;
+std::atomic<unsigned long> lastDataFrameMs{0};
+
+void enqueueSerialFrame(const char *line) {
+  const size_t lineLength = strlen(line);
+  if (lineLength + 4 > SERIAL_FRAME_CAPACITY) {
+    return;
+  }
+
+  const bool isPriority = strncmp(line, "ACK,", 4) == 0 ||
+                          strncmp(line, "ERROR,", 6) == 0;
+  portENTER_CRITICAL(&serialFrameMux);
+  if (pendingSerialFrameLength > 0 && pendingSerialFramePriority && !isPriority) {
+    portEXIT_CRITICAL(&serialFrameMux);
+    return;
+  }
+  memcpy(pendingSerialFrame, "RX,", 3);
+  memcpy(pendingSerialFrame + 3, line, lineLength);
+  pendingSerialFrame[3 + lineLength] = '\n';
+  pendingSerialFrameLength = 4 + lineLength;
+  pendingSerialFramePriority = isPriority;
+  portEXIT_CRITICAL(&serialFrameMux);
+}
+
+void flushSerialFrames() {
+  for (;;) {
+    if (serialOutputFrameOffset == serialOutputFrameLength) {
+      portENTER_CRITICAL(&serialFrameMux);
+      if (pendingSerialFrameLength == 0) {
+        portEXIT_CRITICAL(&serialFrameMux);
+        return;
+      }
+      memcpy(serialOutputFrame, pendingSerialFrame, pendingSerialFrameLength);
+      serialOutputFrameLength = pendingSerialFrameLength;
+      serialOutputFrameOffset = 0;
+      pendingSerialFrameLength = 0;
+      pendingSerialFramePriority = false;
+      portEXIT_CRITICAL(&serialFrameMux);
+    }
+    const int available = Serial.availableForWrite();
+    if (available <= 0) {
+      return;
+    }
+    const size_t remaining = serialOutputFrameLength - serialOutputFrameOffset;
+    const size_t chunkLength = remaining < static_cast<size_t>(available)
+                                   ? remaining
+                                   : static_cast<size_t>(available);
+    const size_t written = Serial.write(
+        reinterpret_cast<const uint8_t *>(serialOutputFrame +
+                                          serialOutputFrameOffset),
+        chunkLength);
+    if (written == 0) {
+      return;
+    }
+    serialOutputFrameOffset += written;
+  }
+}
 
 class CentralClientCallbacks final : public BLEClientCallbacks {
 public:
   void onConnect(BLEClient *connectedClient) override {
     (void)connectedClient;
-    printf("GATT open event received\n");
   }
 
   void onDisconnect(BLEClient *disconnectedClient) override {
     (void)disconnectedClient;
-    printf("GATT disconnect event received\n");
   }
 };
 
@@ -63,7 +129,17 @@ void notifyCallback(BLERemoteCharacteristic *characteristic, uint8_t *data,
     if (incoming == '\n') {
       if (!discardingNotificationLine && notificationLineLength > 0) {
         notificationLine[notificationLineLength] = '\0';
-        printf("RX,%s\n", notificationLine);
+        if (strncmp(notificationLine, "DATA,", 5) == 0) {
+          size_t separators = 0;
+          for (size_t position = 0; position < notificationLineLength;
+               ++position) {
+            separators += notificationLine[position] == ',';
+          }
+          if (separators == 7) {
+            lastDataFrameMs.store(millis());
+          }
+        }
+        enqueueSerialFrame(notificationLine);
       }
       notificationLineLength = 0;
       discardingNotificationLine = false;
@@ -73,7 +149,6 @@ void notifyCallback(BLERemoteCharacteristic *characteristic, uint8_t *data,
       } else {
         notificationLineLength = 0;
         discardingNotificationLine = true;
-        printf("ERROR,BLE notification line too long\n");
       }
     }
   }
@@ -84,7 +159,7 @@ bool scanForPeripheral() {
   printf("BLE scanning for %s\n", kDeviceName);
   peerFound = false;
   scanner->clearResults();
-  BLEScanResults *results = scanner->start(3, false);
+  BLEScanResults *results = scanner->start(1, false);
   if (results == nullptr) {
     printf("BLE scan returned no results\n");
     return false;
@@ -167,12 +242,30 @@ bool connectToPeripheral() {
   // 購読完了をMG24が受け取ると、MG24側の10ms周期DATA送信が始まる。
   notificationLineLength = 0;
   discardingNotificationLine = false;
+  // registerForNotify()はvoidなので、CCCDの存在と書き込み結果を直接確認する。
+  if (dataCharacteristic->getDescriptor(BLEUUID(static_cast<uint16_t>(0x2902))) ==
+      nullptr) {
+    printf("ERROR,BLE notification descriptor not found\n");
+    client->disconnect();
+    return false;
+  }
+#if defined(CONFIG_NIMBLE_ENABLED)
+  if (!dataCharacteristic->subscribe(true, notifyCallback, true)) {
+    printf("ERROR,BLE notification subscription failed\n");
+    client->disconnect();
+    return false;
+  }
+#else
   dataCharacteristic->registerForNotify(notifyCallback, true, true);
+#endif
   if (!client->isConnected()) {
     printf("ERROR,BLE disconnected during notification subscription\n");
     return false;
   }
   connected = true;
+  streamingExpected = true;
+  connectedAtMs = millis();
+  lastDataFrameMs.store(connectedAtMs);
   printf("BLE subscribed; bidirectional GATT ready\n");
   return true;
 }
@@ -183,7 +276,7 @@ void sendCommand(const char *command, size_t length) {
     return;
   }
 
-  char packet[50];
+  char packet[20];
   if (length + 1 > sizeof(packet) || length + 1 > 20) {
     printf("ERROR,command too long for one BLE write\n");
     return;
@@ -193,6 +286,16 @@ void sendCommand(const char *command, size_t length) {
   packet[length] = '\n';
   if (dataCharacteristic->writeValue(
           reinterpret_cast<uint8_t *>(packet), length + 1, false)) {
+    if (length == strlen("CMD,STOP") &&
+        memcmp(command, "CMD,STOP", length) == 0) {
+      streamingExpected = false;
+    } else if ((length == strlen("CMD,START") &&
+                memcmp(command, "CMD,START", length) == 0) ||
+               (length == strlen("CMD,RESET") &&
+                memcmp(command, "CMD,RESET", length) == 0)) {
+      streamingExpected = true;
+      lastDataFrameMs.store(millis());
+    }
     printf("TX,%.*s\n", static_cast<int>(length), command);
   } else {
     printf("ERROR,BLE write failed\n");
@@ -240,6 +343,7 @@ void setup() {
 }
 
 void loop() {
+  flushSerialFrames();
   if (client != nullptr && (!connected || !client->isConnected())) {
     connected = false;
     dataCharacteristic = nullptr;
@@ -262,10 +366,19 @@ void loop() {
     return;
   }
 
+  if (streamingExpected && millis() - lastDataFrameMs.load() > DATA_TIMEOUT_MS) {
+    printf("ERROR,BLE subscribed but no sensor DATA for %lu ms; reconnecting\n",
+           DATA_TIMEOUT_MS);
+    client->disconnect();
+    connected = false;
+    return;
+  }
+
   if (!initialCommandSent && millis() - connectedAtMs >= 250) {
     sendCommand("CMD,RESET", strlen("CMD,RESET"));
     initialCommandSent = true;
   }
   pollSerialCommands();
+  flushSerialFrames();
   delay(1);
 }
