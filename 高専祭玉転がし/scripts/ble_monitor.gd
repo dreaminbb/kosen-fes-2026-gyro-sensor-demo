@@ -10,6 +10,7 @@ const MAX_SERIAL_LINE_BYTES := 16384
 const SERIAL_READ_CHUNK_BYTES := 8192
 const MAX_SERIAL_READ_BYTES_PER_POLL := 65536
 const SENSOR_STALE_USEC := 250000
+const SENSOR_ORIENTATION_SMOOTHING_RATE := 40.0
 const MOCHA_BASE := Color("#1e1e2e")
 const MOCHA_MANTLE := Color("#181825")
 const MOCHA_SURFACE_0 := Color("#313244")
@@ -41,11 +42,11 @@ var commands_sent := 0
 var last_sensor_timestamp := -1
 var integrated_yaw := 0.0
 var sensor_angular_velocity := Vector3.ZERO
-var neutral_roll := 0.0
-var neutral_pitch := 0.0
 var current_sensor_roll := 0.0
 var current_sensor_pitch := 0.0
-var tilt_calibrated := false
+var sensor_orientation_target := Quaternion.IDENTITY
+var sensor_orientation_model: Node3D
+var sensor_orientation_status_label: Label
 var sensor_pose_available := false
 var ball_status_elapsed := 0.0
 var latest_sensor_fields := PackedStringArray()
@@ -64,7 +65,6 @@ var attitude_label: Label
 var log_output: RichTextLabel
 var ball_game: BallPlatform
 var ball_status_label: Label
-var calibrate_button: Button
 var connection_panel: PanelContainer
 var connection_panel_button: Button
 var connection_status_label: Label
@@ -92,11 +92,18 @@ func _physics_process(_delta: float) -> void:
 	var focus := get_viewport().gui_get_focus_owner()
 	ball_game.keyboard_enabled = not sensor_fresh and not (focus is LineEdit)
 	ball_game.set_sensor_angular_velocity(sensor_angular_velocity if sensor_fresh else Vector3.ZERO)
+	if is_instance_valid(sensor_orientation_status_label):
+		sensor_orientation_status_label.text = "● RAW SENSOR" if sensor_fresh else "センサーデータを待っています"
 	if not sensor_fresh and focus is LineEdit:
 		ball_game.set_target_tilt(0.0, 0.0)
 
 
 func _process(delta: float) -> void:
+	if is_instance_valid(sensor_orientation_model):
+		var target_orientation := sensor_orientation_target if sensor_pose_available else Quaternion.IDENTITY
+		sensor_orientation_model.quaternion = sensor_orientation_model.quaternion.slerp(
+			target_orientation, 1.0 - exp(-SENSOR_ORIENTATION_SMOOTHING_RATE * delta)
+		)
 	ball_status_elapsed += delta
 	if ball_status_elapsed >= 0.1 and is_instance_valid(ball_game):
 		ball_status_elapsed = 0.0
@@ -127,6 +134,7 @@ func _build_ui() -> void:
 	overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(overlay)
+	_create_sensor_orientation_card(overlay)
 
 	var top_right := HBoxContainer.new()
 	top_right.add_theme_constant_override("separation", 10)
@@ -158,12 +166,6 @@ func _build_ui() -> void:
 	game_controls.position = Vector2(-482, 88)
 	game_controls.size = Vector2(458, 52)
 	overlay.add_child(game_controls)
-	calibrate_button = Button.new()
-	calibrate_button.text = "水平を合わせる"
-	calibrate_button.disabled = true
-	calibrate_button.pressed.connect(_calibrate_platform)
-	_style_game_button(calibrate_button, MOCHA_BLUE)
-	game_controls.add_child(calibrate_button)
 	var reset_ball_button := Button.new()
 	reset_ball_button.text = "もう一度"
 	reset_ball_button.pressed.connect(func() -> void: ball_game.reset_ball())
@@ -605,7 +607,7 @@ func _handle_serial_line(line: String) -> void:
 		connection_status_label.text = "●  BLE再接続中"
 		connection_status_label.add_theme_color_override("font_color", MOCHA_YELLOW)
 		_set_status("MG24とのBLE切断。C6が再接続しています…")
-		_clear_platform_calibration()
+		_clear_sensor_state()
 	elif line.begins_with("ERROR,") or line.begins_with("WARNING,"):
 		_log("C6: " + line)
 
@@ -641,7 +643,7 @@ func _set_connected(is_connected: bool) -> void:
 		discarding_serial_line = false
 		last_sensor_timestamp = -1
 		integrated_yaw = 0.0
-		_clear_platform_calibration()
+		_clear_sensor_state()
 		_set_status("C6のシリアルポート未接続")
 		_toggle_connection_panel(true)
 		connection_panel_button.set_pressed_no_signal(true)
@@ -665,7 +667,7 @@ func _handle_serial_message(message: String) -> void:
 		if response == "RESET":
 			last_sensor_timestamp = -1
 			integrated_yaw = 0.0
-			_clear_platform_calibration()
+			_clear_sensor_state()
 			ball_game.reset_ball()
 		_log("MG24からの応答: %s" % response)
 		messages_received += 1
@@ -703,7 +705,7 @@ func _update_telemetry(message: String) -> bool:
 
 
 func _update_model_from_sensor(fields: PackedStringArray) -> void:
-	var sensor_time := fields[1].to_int()
+	var sensor_time_us := fields[1].to_int()
 	var accel_x := fields[2].to_float()
 	var accel_y := fields[3].to_float()
 	var accel_z := fields[4].to_float()
@@ -716,30 +718,30 @@ func _update_model_from_sensor(fields: PackedStringArray) -> void:
 
 	var roll := atan2(accel_y, accel_z)
 	var pitch := atan2(-accel_x, sqrt(accel_y * accel_y + accel_z * accel_z))
-	var elapsed_ms := 0
+	var elapsed_us := 0
 	if last_sensor_timestamp >= 0:
-		elapsed_ms = (sensor_time - last_sensor_timestamp + 4294967296) % 4294967296
+		elapsed_us = (sensor_time_us - last_sensor_timestamp + 4294967296) % 4294967296
 	else:
-		# 初回は送信側が報告した1周期（現在10 ms）だけ角速度を積分する。
-		elapsed_ms = sensor_time
-	if elapsed_ms > 0 and elapsed_ms <= 1000:
-		integrated_yaw += deg_to_rad(gyro_z) * float(elapsed_ms) / 1000.0
-		# 9/10/11 msの時刻丸めでHz表示がちらつかないよう、表示用の周期だけ平滑化する。
-		sensor_period_ms = float(elapsed_ms) if sensor_period_ms <= 0.0 else lerpf(sensor_period_ms, float(elapsed_ms), 0.05)
-	last_sensor_timestamp = sensor_time
+		# 初回は送信側が報告した1周期（現在2 ms）だけ角速度を積分する。
+		elapsed_us = sensor_time_us
+	if elapsed_us > 0 and elapsed_us <= 1000000:
+		integrated_yaw += deg_to_rad(gyro_z) * float(elapsed_us) / 1000000.0
+		var elapsed_ms := float(elapsed_us) / 1000.0
+		# 表示周期のちらつきだけ抑え、500 Hz付近の実受信周期を表示する。
+		sensor_period_ms = elapsed_ms if sensor_period_ms <= 0.0 else lerpf(sensor_period_ms, elapsed_ms, 0.05)
+	last_sensor_timestamp = sensor_time_us
 	last_sensor_receive_usec = Time.get_ticks_usec()
 
 	current_sensor_roll = roll
 	current_sensor_pitch = pitch
+	# 表示用モデルには水平校正をかける前の生Roll/Pitchとジャイロ積算Yawを使う。
+	sensor_orientation_target = Basis.from_euler(
+		Vector3(pitch, integrated_yaw, roll)
+	).get_rotation_quaternion()
 	sensor_angular_velocity = Vector3(deg_to_rad(gyro_x), deg_to_rad(gyro_y), deg_to_rad(gyro_z))
 	sensor_pose_available = true
-	calibrate_button.disabled = false
-	if not tilt_calibrated:
-		_calibrate_platform()
-	# 現在の取り付け姿勢を水平の基準にし、境界±PIをまたぐ傾きも連続に扱う。
-	ball_game.set_target_tilt(
-		wrapf(pitch - neutral_pitch, -PI, PI), wrapf(roll - neutral_roll, -PI, PI)
-	)
+	# 水平校正なしで、センサーが示す現在のPitch/Rollをそのまま台へ反映する。
+	ball_game.set_target_tilt(pitch, roll)
 
 
 func _refresh_sensor_labels() -> void:
@@ -755,27 +757,157 @@ func _refresh_sensor_labels() -> void:
 	]
 
 
-func _calibrate_platform() -> void:
-	if not sensor_pose_available:
-		return
-	neutral_roll = current_sensor_roll
-	neutral_pitch = current_sensor_pitch
-	tilt_calibrated = true
-	ball_game.set_target_tilt(0.0, 0.0)
-
-
-func _clear_platform_calibration() -> void:
-	tilt_calibrated = false
+func _clear_sensor_state() -> void:
 	sensor_pose_available = false
+	sensor_orientation_target = Quaternion.IDENTITY
 	sensor_angular_velocity = Vector3.ZERO
 	last_sensor_receive_usec = 0
 	sensor_period_ms = 0.0
 	latest_sensor_fields.clear()
 	telemetry_label.text = "センサーデータ: 未受信"
 	attitude_label.text = "姿勢: 次のセンサーデータを待っています"
-	calibrate_button.disabled = true
 	if is_instance_valid(ball_game):
 		ball_game.set_target_tilt(0.0, 0.0)
+
+
+func _create_sensor_orientation_card(overlay: Control) -> void:
+	var card := _make_game_panel("SensorOrientation")
+	_set_panel_rect(card, 0.0, 0.0, 0.0, 0.0, Vector4(24, 24, 324, 334))
+	card.custom_minimum_size = Vector2(300, 310)
+	card.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	overlay.add_child(card)
+
+	var layout := VBoxContainer.new()
+	layout.add_theme_constant_override("separation", 5)
+	card.add_child(layout)
+	var heading := Label.new()
+	heading.text = "RAW IMU RESPONSE  ·  XYZ"
+	heading.add_theme_color_override("font_color", MOCHA_TEAL)
+	heading.add_theme_font_size_override("font_size", 12)
+	layout.add_child(heading)
+
+	var view_container := SubViewportContainer.new()
+	view_container.custom_minimum_size = Vector2(268, 220)
+	view_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	view_container.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	view_container.stretch = true
+	view_container.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	layout.add_child(view_container)
+	var viewport := SubViewport.new()
+	viewport.size = Vector2i(268, 220)
+	viewport.own_world_3d = true
+	viewport.disable_3d = false
+	viewport.transparent_bg = true
+	viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	view_container.add_child(viewport)
+	_create_sensor_orientation_preview(viewport)
+
+	sensor_orientation_status_label = Label.new()
+	sensor_orientation_status_label.text = "センサーデータを待っています"
+	sensor_orientation_status_label.add_theme_color_override("font_color", MOCHA_SUBTEXT)
+	sensor_orientation_status_label.add_theme_font_size_override("font_size", 11)
+	layout.add_child(sensor_orientation_status_label)
+
+
+func _create_sensor_orientation_preview(viewport: SubViewport) -> void:
+	var world := Node3D.new()
+	viewport.add_child(world)
+
+	var environment_node := WorldEnvironment.new()
+	var environment := Environment.new()
+	environment.background_mode = Environment.BG_COLOR
+	environment.background_color = Color(MOCHA_MANTLE, 0.0)
+	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	environment.ambient_light_color = MOCHA_TEXT
+	environment.ambient_light_energy = 0.8
+	environment_node.environment = environment
+	world.add_child(environment_node)
+
+	var camera := Camera3D.new()
+	camera.position = Vector3(2.8, 2.4, 3.4)
+	camera.projection = Camera3D.PROJECTION_ORTHOGONAL
+	camera.size = 2.45
+	camera.keep_aspect = Camera3D.KEEP_HEIGHT
+	world.add_child(camera)
+	camera.look_at(Vector3(0.0, 0.12, 0.0), Vector3.UP)
+	camera.current = true
+
+	var light := DirectionalLight3D.new()
+	light.rotation_degrees = Vector3(-38.0, -28.0, 0.0)
+	light.light_energy = 1.4
+	world.add_child(light)
+
+	sensor_orientation_model = Node3D.new()
+	sensor_orientation_model.name = "RawSensorOrientation"
+	world.add_child(sensor_orientation_model)
+
+	var board := MeshInstance3D.new()
+	var board_mesh := BoxMesh.new()
+	board_mesh.size = Vector3(0.92, 0.09, 0.68)
+	board.mesh = board_mesh
+	board.position = Vector3(0.0, -0.055, 0.0)
+	board.material_override = _make_orientation_material(MOCHA_SURFACE_1)
+	sensor_orientation_model.add_child(board)
+
+	var sensor_chip := MeshInstance3D.new()
+	var chip_mesh := BoxMesh.new()
+	chip_mesh.size = Vector3(0.24, 0.12, 0.2)
+	sensor_chip.mesh = chip_mesh
+	sensor_chip.position = Vector3(0.0, 0.05, 0.0)
+	sensor_chip.material_override = _make_orientation_material(MOCHA_LAVENDER)
+	sensor_orientation_model.add_child(sensor_chip)
+
+	_add_sensor_axis(sensor_orientation_model, Vector3.RIGHT, "X", MOCHA_RED)
+	_add_sensor_axis(sensor_orientation_model, Vector3.UP, "Y", MOCHA_GREEN)
+	_add_sensor_axis(sensor_orientation_model, Vector3.BACK, "Z", MOCHA_BLUE)
+
+
+func _add_sensor_axis(parent: Node3D, axis: Vector3, axis_name: String, color: Color) -> void:
+	var axis_origin := Vector3(0.0, 0.12, 0.0)
+	var axis_rotation := Quaternion(Vector3.UP, axis)
+	var axis_material := _make_orientation_material(color)
+
+	var shaft := MeshInstance3D.new()
+	var shaft_mesh := CylinderMesh.new()
+	shaft_mesh.top_radius = 0.022
+	shaft_mesh.bottom_radius = 0.022
+	shaft_mesh.height = 0.48
+	shaft.mesh = shaft_mesh
+	shaft.position = axis_origin + axis * 0.28
+	shaft.quaternion = axis_rotation
+	shaft.material_override = axis_material
+	parent.add_child(shaft)
+
+	var arrow_head := MeshInstance3D.new()
+	var arrow_mesh := CylinderMesh.new()
+	arrow_mesh.top_radius = 0.0
+	arrow_mesh.bottom_radius = 0.075
+	arrow_mesh.height = 0.16
+	arrow_head.mesh = arrow_mesh
+	arrow_head.position = axis_origin + axis * 0.59
+	arrow_head.quaternion = axis_rotation
+	arrow_head.material_override = axis_material
+	parent.add_child(arrow_head)
+
+	var axis_label := Label3D.new()
+	axis_label.text = axis_name
+	axis_label.position = axis_origin + axis * 0.76
+	axis_label.font_size = 32
+	axis_label.pixel_size = 0.012
+	axis_label.modulate = color
+	axis_label.outline_modulate = Color("0f172a")
+	axis_label.outline_size = 5
+	parent.add_child(axis_label)
+
+
+func _make_orientation_material(color: Color) -> StandardMaterial3D:
+	var material := StandardMaterial3D.new()
+	material.albedo_color = color
+	material.emission_enabled = true
+	material.emission = color
+	material.emission_energy_multiplier = 0.25
+	material.roughness = 0.38
+	return material
 
 
 func _create_3d_preview(viewport: SubViewport) -> void:

@@ -1,7 +1,7 @@
 // PCへの送信経路:
 //   MG24がGATTサービス/特性を用意してアドバタイズ ->
 //   C6が発見・接続して通知を購読
-//   -> 購読開始後、MG24が実センサー値をDATA行にして10msごとに通知
+//   -> 購読開始後、MG24が実センサー値をDATA行にして2msごとに通知
 //   -> C6が通知をUSBシリアルへ転送 -> Godotがシリアル行を解析して画面を更新
 // 逆方向はGodotのCMD行をC6がBLE Write Without
 // ResponseでMG24へ転送し、ACKを通知する。
@@ -19,6 +19,7 @@
 #include <string.h>
 
 #define SENSOR_POLL_INTERVAL_MS 0
+#define SENSOR_THRESHOLD_ACCEL 0.1f
 
 namespace {
 // BLEイベントタスクのスタックは1000 bytes。浮動小数点のprintfや
@@ -39,9 +40,9 @@ const uint8_t nameScanResponse[] = {0x0a, 0x09, 'K', 'o', 's', 'e',
                                     'n',  'B',  'a', 'l', 'l'};
 const uint16_t gattValueMaxLength = 250;
 const uint16_t defaultNotificationPayloadSize = 20;
-// 実センサーを100 Hzで送信する。IMU内部は416 Hz、BLE接続間隔は7.5 ms。
+// IMUを833 Hzで動作させ、実センサー値を500 Hz（2 ms）でBLE送信する。
 // sample.hのテスト列（100 ms）とは独立した周期。
-constexpr unsigned long SENSOR_SEND_INTERVAL_MS = 10;
+constexpr unsigned long SENSOR_SEND_INTERVAL_US = 2000;
 constexpr unsigned long SENSOR_LOG_INTERVAL_MS = 1000;
 
 const uuid_128 sppServiceUuid = {.data = {0x07, 0xb9, 0xf9, 0xd7, 0x50, 0xa4,
@@ -65,8 +66,8 @@ bool notificationsEnabled = false;
 bool streamingEnabled = true;
 bool sessionClockStarted = false;
 int monitoringIndex = 0;
-unsigned long sessionStartedMs = 0;
-unsigned long lastSensorSendMs = 0;
+unsigned long sessionStartedUs = 0;
+unsigned long lastSensorSendUs = 0;
 unsigned long lastSensorLogMs = 0;
 
 // 加速度センサーのインスタンス
@@ -74,9 +75,17 @@ LSM6DS3 myIMU(I2C_MODE, 0x6A);
 bool imuReady = false;
 
 SensorData fetchSensorData() {
-  // 1送信周期ごとに6軸を読み取り、BLE通知用の値として返す。
-  return SensorData{myIMU.readFloatAccelX(), myIMU.readFloatAccelY(),
-                    myIMU.readFloatAccelZ(), myIMU.readFloatGyroX(),
+  // 各軸を一度ずつ読み、重複したI2C読み出しを避けて500 Hzを保つ。
+  const float accelX = myIMU.readFloatAccelX();
+  const float accelY = myIMU.readFloatAccelY();
+  const float accelZ = myIMU.readFloatAccelZ();
+  if (fabs(accelX) < SENSOR_THRESHOLD_ACCEL &&
+      fabs(accelY) < SENSOR_THRESHOLD_ACCEL &&
+      fabs(accelZ) < SENSOR_THRESHOLD_ACCEL) {
+    Serial.print("WARNING: LSM6DS3 acceleration is too small; check sensor\n");
+    return SensorData{0, 0, 0, 0, 0, 0};
+  }
+  return SensorData{accelX, accelY, accelZ, myIMU.readFloatGyroX(),
                     myIMU.readFloatGyroY(),  myIMU.readFloatGyroZ()};
 }
 
@@ -297,8 +306,12 @@ void setup() {
   Serial.print("XIAO MG24 BLE sensor peripheral starting\n");
 
   Serial.print("LSM6DS3 initialization starting\n");
+  myIMU.settings.accelSampleRate = 833;
+  myIMU.settings.gyroSampleRate = 833;
+  myIMU.settings.accelBandWidth = 400;
   imuReady = myIMU.begin() == 0;
   if (imuReady) {
+    Wire1.setClock(400000);
     Serial.print("LSM6DS3 initialized\n");
   } else {
     Serial.print("ERROR: LSM6DS3 initialization failed\n");
@@ -316,42 +329,41 @@ void loop() {
     Serial.print("ERROR: BLE event queue overflow\n");
   }
 
-  const unsigned long now = millis();
+  const unsigned long nowMs = millis();
+  const unsigned long nowUs = micros();
   if (!imuReady || !notificationsEnabled || !streamingEnabled) {
     delay(1);
     return;
   }
 
   // 接続しただけでは送らず、C6がCCCDで通知購読を有効にした後に送信する。
-  if (now - lastSensorSendMs >= SENSOR_SEND_INTERVAL_MS) {
-    // 基準時刻へ周期を足し、loopの1 ms待機による遅れを次回へ積み上げない。
-    // 長い停止の後は取り戻すための連続送信をせず、最新サンプルだけ送る。
-    lastSensorSendMs += SENSOR_SEND_INTERVAL_MS;
-    if (now - lastSensorSendMs >= SENSOR_SEND_INTERVAL_MS) {
-      lastSensorSendMs = now;
+  if (nowUs - lastSensorSendUs >= SENSOR_SEND_INTERVAL_US) {
+    // マイクロ秒の基準時刻で周期を保ち、長い停止後に追いつき送信をしない。
+    lastSensorSendUs += SENSOR_SEND_INTERVAL_US;
+    if (nowUs - lastSensorSendUs >= SENSOR_SEND_INTERVAL_US) {
+      lastSensorSendUs = nowUs;
     }
-    if (!sessionClockStarted) {
-      // 初回サンプルの経過時刻を1周期（10
-      // ms）とし、以降は実際の経過時間を送る。
-      sessionStartedMs = now - SENSOR_SEND_INTERVAL_MS;
-      sessionClockStarted = true;
-    }
-
     // const SensorData data = sampleData(monitoringIndex);
     const SensorData data = fetchSensorData();
-    const unsigned long elapsedMs = now - sessionStartedMs;
+    const unsigned long sampleTimeUs = micros();
+    if (!sessionClockStarted) {
+      // 初回サンプル時刻を1周期前とし、以降はマイクロ秒単位で送る。
+      sessionStartedUs = sampleTimeUs - SENSOR_SEND_INTERVAL_US;
+      sessionClockStarted = true;
+    }
+    const unsigned long elapsedUs = sampleTimeUs - sessionStartedUs;
     char message[128];
     const int messageLength = snprintf(
         message, sizeof(message), "DATA,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-        elapsedMs, data.accelX, data.accelY, data.accelZ, data.gyroX,
+        elapsedUs, data.accelX, data.accelY, data.accelZ, data.gyroX,
         data.gyroY, data.gyroZ);
 
     if (messageLength > 0 &&
         static_cast<size_t>(messageLength) < sizeof(message)) {
       // シリアル出力でサンプリングを待たせないよう、通常ログは1秒に1回に制限する。
       if (sendNotificationText(message) &&
-          now - lastSensorLogMs >= SENSOR_LOG_INTERVAL_MS) {
-        lastSensorLogMs = now;
+          nowMs - lastSensorLogMs >= SENSOR_LOG_INTERVAL_MS) {
+        lastSensorLogMs = nowMs;
         Serial.printf("BLE送信: %s", message);
       }
     } else {
@@ -462,7 +474,7 @@ void handleBleEvent(sl_bt_msg_t *event) {
         // C6の通知購読が有効になった時点から、loop()がDATA行を送り始める。
         monitoringIndex = 0;
         sessionClockStarted = false;
-        lastSensorSendMs = millis();
+        lastSensorSendUs = micros();
         Serial.print("BLE notifications enabled; streaming sensor data\n");
       } else {
         Serial.print("BLE notifications disabled\n");

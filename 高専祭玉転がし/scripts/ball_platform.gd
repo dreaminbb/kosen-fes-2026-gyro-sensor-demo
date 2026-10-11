@@ -9,8 +9,8 @@ const BALL_RADIUS := 0.22
 const BALL_DROP_HEIGHT := 1.8
 const FALL_HEIGHT := -3.0
 const MAX_TILT_DEGREES := 18.0
-# 時定数約21 ms。50 Hz・係数16/秒だった台の追従遅れを短縮する。
-const ROTATION_SMOOTHING_RATE := 20.0
+# 時定数25 ms。100 Hzのセンサー入力に合わせて応答遅れを抑える。
+const ROTATION_SMOOTHING_RATE := 40.0
 const START_POSITION := Vector3(0.0, 0.0, 24.0)
 const GOAL_POSITION := Vector3(0.0, 0.0, -26.0)
 const CHECKPOINTS := [
