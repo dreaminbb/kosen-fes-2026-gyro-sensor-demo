@@ -47,6 +47,9 @@ const uint8_t nameScanResponse[] = {0x0a, 0x09, 'K', 'o', 's', 'e',
                                     'n',  'B',  'a', 'l', 'l'};
 const uint16_t gattValueMaxLength = 250;
 const uint16_t defaultNotificationPayloadSize = 20;
+// Arduino-ESP32 3.3.12のNimBLE通知コールバックは最初のmbufだけを渡す。
+// 51 bytes以内なら1つのmbufに収まり、C6側で通知が欠けない。
+const uint16_t maxNotificationPayloadSize = 51;
 // IMUは833 Hzで更新し、Godotの物理更新に近い100 Hzで最新値を送る。
 constexpr unsigned long SENSOR_SEND_INTERVAL_US = 10000;
 constexpr unsigned long NOTIFICATION_RETRY_INTERVAL_US = 5000;
@@ -505,8 +508,9 @@ void handleBleEvent(sl_bt_msg_t *event) {
     const uint16_t mtu = event->data.evt_gatt_mtu_exchanged.mtu;
     if (mtu > 3) {
       const uint16_t payloadSize = mtu - 3;
-      notificationPayloadSize =
-          payloadSize < gattValueMaxLength ? payloadSize : gattValueMaxLength;
+      notificationPayloadSize = payloadSize < maxNotificationPayloadSize
+                                    ? payloadSize
+                                    : maxNotificationPayloadSize;
     }
     Serial.printf("BLE MTU: %u, payload: %u\n", static_cast<unsigned>(mtu),
                   static_cast<unsigned>(notificationPayloadSize));
