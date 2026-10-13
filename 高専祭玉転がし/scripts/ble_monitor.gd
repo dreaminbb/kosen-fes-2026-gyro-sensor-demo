@@ -181,7 +181,7 @@ func _build_ui() -> void:
 	var overview_button := Button.new()
 	overview_button.text = "全体を見る"
 	overview_button.toggle_mode = true
-	overview_button.toggled.connect(func(enabled: bool) -> void: ball_game.overview_enabled = enabled)
+	hhhhhhoverview_button.toggled.connect(func(enabled: bool) -> void: ball_game.overview_enabled = enabled)
 	_style_game_button(overview_button, MOCHA_TEAL)
 	game_controls.add_child(overview_button)
 

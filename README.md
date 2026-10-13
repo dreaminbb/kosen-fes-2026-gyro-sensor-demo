@@ -1,4 +1,4 @@
-# syncball (仮名)　仕様書
+# 仕様書
 
 
 - マイコン処理
@@ -44,10 +44,9 @@ constexpr unsigned long SENSOR_SEND_INTERVAL_MS = 10;  // 10 ms = 100 Hz
 - GATTのUUID、行形式、コマンド一覧はdocument/通信方式.mdを参照する。
 
 
-### 接続処理、簡略化
+### PC受信処理
 
-
-### PC受診処理
+基本センサーのデータは構造体として送られる。
 
 ---
 
@@ -72,10 +71,10 @@ LinuxではUSB機器を接続しても、利用者にデバイスを開く権限
 
 #### 恒久的な対処
 
-次を一度だけ実行する。`shin`は実際のLinux利用者名に置き換える。
+次を一度だけ実行する。`<user>`は実際のLinux利用者名に置き換える。
 
 ```sh
-sudo usermod -aG uucp shin
+sudo usermod -aG uucp <user>
 printf '%s\n' 'SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2886", ATTR{idProduct}=="0062", MODE="0660", GROUP="uucp"' | sudo tee /etc/udev/rules.d/70-xiao-mg24.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger
@@ -100,7 +99,7 @@ arduino-cli board list
 
 ```sh
 mg24_usb=$(lsusb -d 2886:0062 | awk '{gsub(":", "", $4); print "/dev/bus/usb/" $2 "/" $4}')
-sudo setfacl -m u:shin:rw /dev/ttyACM0 /dev/ttyACM1 "$mg24_usb"
+sudo setfacl -m u:<user>:rw /dev/ttyACM0 /dev/ttyACM1 "$mg24_usb"
 getfacl /dev/ttyACM0 /dev/ttyACM1 "$mg24_usb"
 ```
 
@@ -117,7 +116,8 @@ getfacl /dev/ttyACM0 /dev/ttyACM1 "$mg24_usb"
 ---
 
 ## ゲーム処理
----
+
+
 ### データの受診
 
 `高専祭玉転がし/scripts/ble_monitor.gd` がC6の `RX,DATA,...` を解析し、加速度XYZから求めたPitch/Rollで台を傾ける。初回の受信姿勢を水平の基準とし、「水平を合わせる」で現在のセンサー姿勢を基準に取り直せる。Yawは数値表示に使い、台の傾きには反映しない。
@@ -165,9 +165,116 @@ Godot 4.7.2 / Jolt Physics / Metalで、STARTへの着地、壁との実際の�
 ---
 
 ## 実行方法
----
-### マイコン
-### マイコン-PCとの接続管理
-### godbotの操作
 
-Godotを再起動し、C6のシリアルに接続する。コントローラーを操作の基準姿勢に置き、「水平を合わせる」を押してから傾ける。壁・柱を避けて橋を渡り、奥のGOALへ進む。落下時は最後のチェックポイントの上から戻る。「もう一度」で最初から再挑戦、「コース全体」でルートを確認できる。BLE未接続時は↑↓で前後、←→で左右へ球を転がせる。
+### マイコン
+既にファームウェアが書き込まれている完成形の場合は、電源を接続するだけで実行することができる。
+
+ファームウェアを書き込みたい場合は、チップに合わせたプロファイルをインストールして、コンパイラ、書き込みを行う必要がある。
+```bash
+# Arch Linux
+sudo pacman -S arduino-cli
+
+# Arduino CLIの初期設定
+arduino-cli config init
+arduino-cli config add board_manager.additional_urls \
+  https://siliconlabs.github.io/arduino/package_arduinosilabs_index.json
+arduino-cli config add board_manager.additional_urls \
+  https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+# ボード定義
+rduino-cli core update-index
+arduino-cli core install SiliconLabs:silabs@5.0.0
+arduino-cli core install esp32:esp32@3.3.12
+
+# MG24のIMUライブラリ
+arduino-cli lib install "Seeed Arduino LSM6DS3"
+
+LinuxのUSB権限も一度だけ設定します。shin はLinuxユーザー名に置き換えてください。
+
+sudo usermod -aG uucp shin
+printf '%s\n' 'SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2886", ATTR{idProduct}=="0062", MODE="0660", GROUP="uucp"' \
+  | sudo tee /etc/udev/rules.d/70-xiao-mg24.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# この後はログアウトしてログインし直し、MG24を抜き差しします。
+
+# ビルドと書き込みはリポジトリ直下で実行します。
+
+# MG24
+arduino-cli compile \
+  --fqbn "SiliconLabs:silabs:xiao_mg24:protocol_stack=ble_silabs" .
+
+arduino-cli upload \
+  --fqbn "SiliconLabs:silabs:xiao_mg24:protocol_stack=ble_silabs" \
+  --port /dev/ttyACM1 .
+
+# ESP32-C6
+arduino-cli compile \
+  --fqbn esp32:esp32:XIAO_ESP32C6 \
+  ble/c6_central
+
+arduino-cli upload \
+  --fqbn esp32:esp32:XIAO_ESP32C6 \
+  --port /dev/ttyACM0 \
+  ble/c6_central
+
+ttyACM0 と ttyACM1 は抜き差し順で入れ替わるため、書き込み前に確認してください。
+
+arduino-cli board list
+lsusb -d 2886:0062
+```
+
+#### PCとの通信方式
+
+##### 接続方式
+
+Seeed Studio XIAO MG24 (Sense) と XIAO ESP32-C6 をBLE 5 GATTで接続し、C6をUSBでPCに接続する。MG24は `KosenBall` としてPeripheral動作し、C6がCentralとして通知を受信する。GodotはC6のUSBシリアルを115200 baudで開き、センサーデータを表示してコマンドを送る。
+
+##### GATT仕様
+
+- Service UUID: 4880c12c-fdcb-4077-8920-a450d7f9b907
+- Data Characteristic UUID: fec26ec4-6d71-4442-9f81-55bc21d658d6
+- MG24からPC: Notification
+- PCからMG24: Write Without Response
+- 1行をLFで区切る。BLEパケットが分割されても受信側で行を再構成する。
+
+テレメトリー形式は DATA,elapsedUs,accelX,accelY,accelZ,gyroX,gyroY,gyroZ。elapsedUsは送信開始からの経過マイクロ秒、加速度はg、角速度は度/秒。現在のファームウェアはLSM6DS3の加速度・ジャイロを833 Hzで動作させ、実測値を10 ms周期（目標100 Hz）で送信する。センサー値は各サンプルで一度ずつ読み出し、センサーが実際に使用する `Wire` のI2Cクロックを400 kHzに設定する。sample.hのテスト列とは独立した設定である。
+
+Godotからは `CMD,START`、`CMD,STOP`、`CMD,RESET` を送れる。C6がBLE Write Without ResponseでMG24へ転送し、MG24は `ACK,START`、`ACK,STOP`、`ACK,RESET` で応答する。RESETは送信開始時刻とGodotの姿勢表示をリセットし、送信を再開する。
+
+##### ビルド設定
+
+Arduino CLIではBLE (Silabs)スタックを選択する。XIAO MG24の既定スタック（Matter）のままではこのGATTファームウェアをビルドできない。
+
+ビルドコマンド:
+
+    arduino-cli compile --fqbn "SiliconLabs:silabs:xiao_mg24:protocol_stack=ble_silabs" .
+
+Godotプロジェクトは `高専祭玉転がし/project.godot` を開いて実行する。Godot起動時にC6のUSBシリアルポートを探し、見つからない場合は画面のポート欄へ入力する。Godotは `arduino-cli monitor` を起動するため、Arduino CLIがPATHにあり、ポートを他のシリアルモニターが使用していないこと。
+
+##### MG24–ESP32-C6間の低遅延双方向通信
+
+MG24とC6の間では、BLE 5の接続型GATTを使う。MG24がPeripheral、C6がCentralとなり、同じData CharacteristicをMG24→C6のNotificationとC6→MG24のWrite Without Responseに共用する。
+
+MG24が最短の接続間隔7.5 ms（BLE単位6）を要求する。実際に適用された間隔はMG24の `BLE interval:` ログで確認する。C6はMTU 247を設定する。MG24は通知を最大51 bytesに分割し、C6はLFまで蓄積して完全な行を `RX,` 付きでUSBシリアルへ出す。通知境界に改行を追加しない。MG24は通知リソース不足時に未送信の断片を保持して再試行し、古い未送信DATAを最新値で置き換える。通常の送信ログは出さず、シリアル出力による待ち時間を減らす。
+
+受信容量はC6が160 bytes（終端NULを除く1行159 bytes）、Godotが1行16384 bytes。MG24のDATA行は最大128 bytesの送信バッファ内で作成する。これらは行の容量であり、BLEの1パケットのMTUを変更する設定ではない。Godotは完全な行を処理した後に残った行の断片を保持する。複数の正常な行がまとめて届いても、合計サイズで「line too long」と判断しない。上限を超える1行はLFまで破棄し、次の正常な行から復帰する。
+
+Godotは120 Hzの物理tickで、台の更新より先にパイプを8192 bytesずつ読み、1回・1パイプにつき最大65536 bytesを処理する。UTF-8は完全な行になってから文字列へ変換する。姿勢表示は指数補間（係数40/秒、時定数約25 ms）で100 Hzの入力へ追従する。文字表示だけを10 Hzに抑え、姿勢計算と台の更新は即時に行う。C6は通知コールバックでシリアル出力せず、最新の完成行をloop()からUSBへ渡す。USB出力が詰まってもBLEイベントタスクを待たせず、`Serial.write()` が一部しか書けないときは残りを保持する。ACKとERRORはDATAより優先する。
+
+MG24の `sl_bt_on_event()` はイベントのコピーをFreeRTOSキューへ入れてすぐに戻る。GATT登録、接続設定、ログの整形、コマンド処理は `loop()` のArduinoタスクで実行する。Silicon Labsコア5.0.0のBluetoothイベントタスクはスタックが1000 bytesで、そこで浮動小数点の `Serial.printf()` を実行するとHardFaultが発生した。実機では接続直後にMG24が停止し、C6ではサービス探索中の切断と `sensor service not found` が出ていた。
+
+C6は接続先のサービスUUID一致を必須とする。接続後のサービス探索中に切断された場合は、サービスが存在しない場合と区別してログへ出す。MG24側の切断ログにはBluetoothスタックのreasonコードを表示する。
+
+C6 Centralをコンパイルする:
+
+    arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 ble/c6_central
+
+C6の接続、サービス探索、通知購読はNimBLEのAPIを直接使用する。Arduino-ESP32の `BLEClient.cpp` にはMTU重複交換時の接続失敗と、通知の最初のmbufだけを渡す問題があった。C6はそのクラスを使用せず、通知全体を `OS_MBUF_PKTLEN` と `os_mbuf_copydata` で読み取る。ボードパッケージ内のファイルを書き換える補助スクリプトは不要。
+
+C6は接続後に `CMD,RESET` を自動送信し、MG24からの `ACK,RESET` と `DATA,...` をUSBシリアルへ出力する。通知購読後、送信が期待される状態で2秒間DATAが届かなければ再接続する。Godotは `arduino-cli monitor` の標準入出力を読み書きし、同じ `CMD,START`、`CMD,STOP`、`CMD,RESET` をC6へ送る。手動で試す場合はGodotを閉じ、C6のシリアルモニターからこれらのコマンドを1行ずつ送る。
+
+
+### godbotの操作
+フォルダ`高専祭玉転がし/`がgodotのプロジェクトファイルであり、godotを開きプロジェクトをインポートすると既存のコードベース、データを読み込んでくれる。

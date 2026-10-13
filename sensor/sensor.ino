@@ -1,4 +1,4 @@
-
+// これはセンサーを試すための簡易的なテスト
 #include <LSM6DS3.h>
 #include <Wire.h>
 
