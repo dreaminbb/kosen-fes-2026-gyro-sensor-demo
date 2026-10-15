@@ -30,6 +30,8 @@ const MOCHA_RED := Color("#f38ba8")
 
 # RESET/起動からこの秒数待ってMG24へSTOPを送る（既定180秒 = 3分）。
 @export_range(0.0, 3600.0, 1.0) var mg24_stop_delay_seconds := 180.0
+# デバッグ用。1〜3を指定すると、そのステージから開始・リセットする。
+@export_range(1, 3, 1) var debug_start_stage := 3
 
 enum GameState { WAITING, WAKING, PLAYING }
 var game_state := GameState.WAITING
@@ -127,7 +129,7 @@ func _physics_process(delta: float) -> void:
 
 func _process(delta: float) -> void:
 	if is_instance_valid(sensor_orientation_model):
-		var target_orientation := sensor_orientation_target if sensor_pose_available else Quaternion.IDENTITY
+		var target_orientation := sensor_orientation_target if sensor_pose_available else _sensor_mounting_orientation()
 		sensor_orientation_model.quaternion = sensor_orientation_model.quaternion.slerp(
 			target_orientation, 1.0 - exp(-SENSOR_ORIENTATION_SMOOTHING_RATE * delta)
 		)
@@ -913,11 +915,12 @@ func _update_telemetry(message: String) -> bool:
 func _update_model_from_sensor(fields: PackedStringArray) -> void:
 	var sensor_time_us := fields[1].to_int()
 	var accel_x := fields[2].to_float()
-	var accel_y := fields[3].to_float()
-	var accel_z := fields[4].to_float()
+	# MG24 is mounted upside down: rotate its sensor frame 180 degrees around X.
+	var accel_y := -fields[3].to_float()
+	var accel_z := -fields[4].to_float()
 	var gyro_x := fields[5].to_float()
-	var gyro_y := fields[6].to_float()
-	var gyro_z := fields[7].to_float()
+	var gyro_y := -fields[6].to_float()
+	var gyro_z := -fields[7].to_float()
 	var gravity_length_squared := accel_x * accel_x + accel_y * accel_y + accel_z * accel_z
 	if gravity_length_squared < 0.0001:
 		return
@@ -941,9 +944,11 @@ func _update_model_from_sensor(fields: PackedStringArray) -> void:
 	current_sensor_roll = roll
 	current_sensor_pitch = pitch
 	# 表示用モデルには水平校正をかける前の生Roll/Pitchとジャイロ積算Yawを使う。
-	sensor_orientation_target = Basis.from_euler(
+	var corrected_orientation := Basis.from_euler(
 		Vector3(pitch, integrated_yaw, roll)
 	).get_rotation_quaternion()
+	# Show the MG24's physical X/Y/Z axes in its upside-down mounting orientation.
+	sensor_orientation_target = corrected_orientation * _sensor_mounting_orientation()
 	sensor_angular_velocity = Vector3(deg_to_rad(gyro_x), deg_to_rad(gyro_y), deg_to_rad(gyro_z))
 	sensor_pose_available = true
 	# 水平校正なしで、センサーが示す現在のPitch/Rollをそのまま台へ反映する。
@@ -965,7 +970,7 @@ func _refresh_sensor_labels() -> void:
 
 func _clear_sensor_state() -> void:
 	sensor_pose_available = false
-	sensor_orientation_target = Quaternion.IDENTITY
+	sensor_orientation_target = _sensor_mounting_orientation()
 	sensor_angular_velocity = Vector3.ZERO
 	last_sensor_receive_usec = 0
 	sensor_period_ms = 0.0
@@ -974,6 +979,10 @@ func _clear_sensor_state() -> void:
 	attitude_label.text = "姿勢: 次のセンサーデータを待っています"
 	if is_instance_valid(ball_game):
 		ball_game.set_target_tilt(0.0, 0.0)
+
+
+func _sensor_mounting_orientation() -> Quaternion:
+	return Quaternion(Vector3.RIGHT, PI)
 
 
 func _create_sensor_orientation_card(overlay: Control) -> void:
@@ -1148,6 +1157,7 @@ func _create_3d_preview(viewport: SubViewport) -> void:
 	world.add_child(light)
 
 	ball_game = BallPlatform.new()
+	ball_game.debug_start_stage = debug_start_stage
 	world.add_child(ball_game)
 	ball_game.follow_camera = camera
 
