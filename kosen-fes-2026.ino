@@ -1,7 +1,7 @@
 // PCへの送信経路:
 //   MG24がGATTサービス/特性を用意してアドバタイズ ->
 //   C6が発見・接続して通知を購読
-//   -> 購読開始後、MG24が実センサー値をDATA行にして10msごとに通知
+//   -> 購読とCMD,START後、MG24が実センサー値をDATA行にして10msごとに通知
 //   -> C6が通知をUSBシリアルへ転送 -> Godotがシリアル行を解析して画面を更新
 // 逆方向はGodotのCMD行をC6がBLE Write Without
 // ResponseでMG24へ転送し、ACKを通知する。
@@ -16,7 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define SENSOR_POLL_INTERVAL_MS 0
+#define SENSOR_POLL_INTERVAL_MS 1
 #define SENSOR_THRESHOLD_ACCEL 0.1f
 
 struct SensorData {
@@ -32,10 +32,51 @@ namespace {
 // BLEイベントタスクのスタックは1000 bytes。浮動小数点のprintfや
 // コマンド処理をそこで実行するとスタックを使い切るため、Arduinoタスクへ渡す。
 constexpr size_t BLE_EVENT_QUEUE_LENGTH = 16;
+constexpr size_t COMMAND_BUFFER_SIZE = 64;
+// 6595056の改善を採用。SDKの最大属性バッファ全体ではなく必要な値だけを保持する。
+struct BleEvent {
+  enum Type : uint8_t {
+    SystemBoot,
+    ConnectionOpened,
+    ConnectionParameters,
+    ConnectionClosed,
+    MtuExchanged,
+    CharacteristicStatus,
+    AttributeValue
+  } type;
+  union {
+    struct {
+      uint8_t connection;
+    } connectionOpened;
+    struct {
+      uint16_t interval;
+      uint16_t latency;
+      uint16_t timeout;
+    } connectionParameters;
+    struct {
+      uint16_t reason;
+    } connectionClosed;
+    struct {
+      uint16_t mtu;
+    } mtuExchanged;
+    struct {
+      uint8_t connection;
+      uint16_t characteristic;
+      uint8_t statusFlags;
+      uint16_t clientConfigFlags;
+    } characteristicStatus;
+    struct {
+      uint16_t attribute;
+      uint8_t length;
+      bool truncated;
+      uint8_t data[COMMAND_BUFFER_SIZE];
+    } attributeValue;
+  } data;
+};
 StaticQueue_t bleEventQueueControl;
-uint8_t bleEventQueueStorage[BLE_EVENT_QUEUE_LENGTH * sizeof(sl_bt_msg_t)];
+uint8_t bleEventQueueStorage[BLE_EVENT_QUEUE_LENGTH * sizeof(BleEvent)];
 QueueHandle_t bleEventQueue =
-    xQueueCreateStatic(BLE_EVENT_QUEUE_LENGTH, sizeof(sl_bt_msg_t),
+    xQueueCreateStatic(BLE_EVENT_QUEUE_LENGTH, sizeof(BleEvent),
                        bleEventQueueStorage, &bleEventQueueControl);
 std::atomic<bool> bleEventQueueOverflow{false};
 
@@ -72,7 +113,8 @@ uint16_t notificationPayloadSize = defaultNotificationPayloadSize;
 
 bool advertisingSetInitialized = false;
 bool notificationsEnabled = false;
-bool streamingEnabled = true;
+// 接続・通知購読だけでは送信せず、C6からのSTART/RESETを待つ。
+bool streamingEnabled = false;
 bool sessionClockStarted = false;
 unsigned long sessionStartedUs = 0;
 unsigned long lastSensorSendUs = 0;
@@ -99,11 +141,15 @@ SensorData fetchSensorData() {
     Serial.print("WARNING: LSM6DS3 acceleration is too small; check sensor\n");
     return SensorData{0, 0, 0, 0, 0, 0};
   }
-  return SensorData{accelX, accelY, accelZ, myIMU.readFloatGyroX(),
-                    myIMU.readFloatGyroY(),  myIMU.readFloatGyroZ()};
+  return SensorData{accelX,
+                    accelY,
+                    accelZ,
+                    myIMU.readFloatGyroX(),
+                    myIMU.readFloatGyroY(),
+                    myIMU.readFloatGyroZ()};
 }
 
-char commandBuffer[64];
+char commandBuffer[COMMAND_BUFFER_SIZE];
 size_t commandLength = 0;
 
 bool reportBleStatus(const char *operation, sl_status_t status) {
@@ -267,10 +313,10 @@ void flushNotification(unsigned long nowUs) {
     return;
   }
 
-  const size_t remaining = pendingNotificationLength - pendingNotificationOffset;
-  const size_t chunkLength = remaining < notificationPayloadSize
-                                 ? remaining
-                                 : notificationPayloadSize;
+  const size_t remaining =
+      pendingNotificationLength - pendingNotificationOffset;
+  const size_t chunkLength =
+      remaining < notificationPayloadSize ? remaining : notificationPayloadSize;
   const sl_status_t status = sl_bt_gatt_server_send_notification(
       connectionHandle, sensorDataCharacteristicHandle, chunkLength,
       reinterpret_cast<const uint8_t *>(pendingNotification +
@@ -305,6 +351,10 @@ void processCommand(const char *command) {
 
   const char *response = "ACK,UNKNOWN\n";
   if (strcmp(command, "CMD,START") == 0) {
+    if (!streamingEnabled) {
+      // 長い休止後も過去の周期へ追いつき送信せず、次の10 ms周期から再開する。
+      lastSensorSendUs = micros();
+    }
     streamingEnabled = true;
     response = "ACK,START\n";
   } else if (strcmp(command, "CMD,STOP") == 0) {
@@ -344,7 +394,7 @@ void processCommandByte(uint8_t byte) {
 
 } // namespace
 
-void handleBleEvent(sl_bt_msg_t *event);
+void handleBleEvent(const BleEvent *event);
 
 void setup() {
   Serial.begin(115200);
@@ -373,7 +423,7 @@ void setup() {
 void loop() {
   // 起動・接続・購読・コマンドを同じArduinoタスクで順番に処理する。
   // センサー未初期化/送信停止中でもBLEイベントは処理し続ける。
-  sl_bt_msg_t event;
+  BleEvent event;
   while (xQueueReceive(bleEventQueue, &event, 0) == pdTRUE) {
     handleBleEvent(&event);
   }
@@ -430,27 +480,70 @@ void loop() {
 // 終了後に再利用されるため、キューへ内容をコピーしてすぐに戻る。
 // ログ整形やBLEコマンドの実行はloop()側のhandleBleEvent()で行う。
 void sl_bt_on_event(sl_bt_msg_t *event) {
+  BleEvent queuedEvent{};
   switch (SL_BT_MSG_ID(event->header)) {
   case sl_bt_evt_system_boot_id:
+    queuedEvent.type = BleEvent::SystemBoot;
+    break;
   case sl_bt_evt_connection_opened_id:
+    queuedEvent.type = BleEvent::ConnectionOpened;
+    queuedEvent.data.connectionOpened.connection =
+        event->data.evt_connection_opened.connection;
+    break;
   case sl_bt_evt_connection_parameters_id:
+    queuedEvent.type = BleEvent::ConnectionParameters;
+    queuedEvent.data.connectionParameters.interval =
+        event->data.evt_connection_parameters.interval;
+    queuedEvent.data.connectionParameters.latency =
+        event->data.evt_connection_parameters.latency;
+    queuedEvent.data.connectionParameters.timeout =
+        event->data.evt_connection_parameters.timeout;
+    break;
   case sl_bt_evt_connection_closed_id:
+    queuedEvent.type = BleEvent::ConnectionClosed;
+    queuedEvent.data.connectionClosed.reason =
+        event->data.evt_connection_closed.reason;
+    break;
   case sl_bt_evt_gatt_mtu_exchanged_id:
+    queuedEvent.type = BleEvent::MtuExchanged;
+    queuedEvent.data.mtuExchanged.mtu = event->data.evt_gatt_mtu_exchanged.mtu;
+    break;
   case sl_bt_evt_gatt_server_characteristic_status_id:
-  case sl_bt_evt_gatt_server_attribute_value_id:
-    if (xQueueSend(bleEventQueue, event, 0) != pdTRUE) {
-      bleEventQueueOverflow.store(true);
-    }
+    queuedEvent.type = BleEvent::CharacteristicStatus;
+    queuedEvent.data.characteristicStatus.connection =
+        event->data.evt_gatt_server_characteristic_status.connection;
+    queuedEvent.data.characteristicStatus.characteristic =
+        event->data.evt_gatt_server_characteristic_status.characteristic;
+    queuedEvent.data.characteristicStatus.statusFlags =
+        event->data.evt_gatt_server_characteristic_status.status_flags;
+    queuedEvent.data.characteristicStatus.clientConfigFlags =
+        event->data.evt_gatt_server_characteristic_status.client_config_flags;
     break;
+  case sl_bt_evt_gatt_server_attribute_value_id: {
+    queuedEvent.type = BleEvent::AttributeValue;
+    queuedEvent.data.attributeValue.attribute =
+        event->data.evt_gatt_server_attribute_value.attribute;
+    const size_t length = event->data.evt_gatt_server_attribute_value.value.len;
+    queuedEvent.data.attributeValue.truncated = length > COMMAND_BUFFER_SIZE;
+    queuedEvent.data.attributeValue.length = static_cast<uint8_t>(
+        length > COMMAND_BUFFER_SIZE ? COMMAND_BUFFER_SIZE : length);
+    memcpy(queuedEvent.data.attributeValue.data,
+           event->data.evt_gatt_server_attribute_value.value.data,
+           queuedEvent.data.attributeValue.length);
+    break;
+  }
   default:
-    break;
+    return;
+  }
+  if (xQueueSend(bleEventQueue, &queuedEvent, 0) != pdTRUE) {
+    bleEventQueueOverflow.store(true);
   }
 }
 
 // ArduinoタスクでGATT初期化、接続設定、通知購読、受信コマンドを処理する。
-void handleBleEvent(sl_bt_msg_t *event) {
-  switch (SL_BT_MSG_ID(event->header)) {
-  case sl_bt_evt_system_boot_id:
+void handleBleEvent(const BleEvent *event) {
+  switch (event->type) {
+  case BleEvent::SystemBoot:
     // BLEスタック起動時にGATTサービスと特性を登録し、C6から見つけられるようアドバタイズする。
     Serial.print("BLE stack booted\n");
     if (initializeGattDatabase()) {
@@ -458,16 +551,16 @@ void handleBleEvent(sl_bt_msg_t *event) {
     }
     break;
 
-  case sl_bt_evt_connection_opened_id:
+  case BleEvent::ConnectionOpened:
     // C6との接続ハンドルを保存し、購読が完了するまではデータ通知を待機させる。
-    connectionHandle = event->data.evt_connection_opened.connection;
+    connectionHandle = event->data.connectionOpened.connection;
     // MTUは接続ごとに交渉する。前の接続の大きなペイロード上限を引き継がない。
     notificationPayloadSize = defaultNotificationPayloadSize;
     notificationsEnabled = false;
     pendingNotificationLength = 0;
     pendingNotificationOffset = 0;
     queuedControlNotificationLength = 0;
-    streamingEnabled = true;
+    streamingEnabled = false;
     sessionClockStarted = false;
     Serial.print("BLE central connected; requesting 7.5 ms interval\n");
     reportBleStatus("request 7.5 ms BLE interval",
@@ -475,10 +568,9 @@ void handleBleEvent(sl_bt_msg_t *event) {
                                                     100, 0, 0xffff));
     break;
 
-  case sl_bt_evt_connection_parameters_id: {
+  case BleEvent::ConnectionParameters: {
     // ネゴシエーション後にBLEスタックが適用した接続間隔などをログへ出す。
-    const sl_bt_evt_connection_parameters_t &parameters =
-        event->data.evt_connection_parameters;
+    const auto &parameters = event->data.connectionParameters;
     Serial.printf("BLE interval: %.2f ms, latency: %u, timeout: %u ms\n",
                   parameters.interval * 1.25f,
                   static_cast<unsigned>(parameters.latency),
@@ -486,26 +578,25 @@ void handleBleEvent(sl_bt_msg_t *event) {
     break;
   }
 
-  case sl_bt_evt_connection_closed_id:
+  case BleEvent::ConnectionClosed:
     // 接続に紐づく状態やコマンド途中の内容を初期化し、次のC6接続に備えてアドバタイズを再開する。
-    Serial.printf(
-        "BLE central disconnected: reason=0x%04X\n",
-        static_cast<unsigned>(event->data.evt_connection_closed.reason));
+    Serial.printf("BLE central disconnected: reason=0x%04X\n",
+                  static_cast<unsigned>(event->data.connectionClosed.reason));
     connectionHandle = SL_BT_INVALID_CONNECTION_HANDLE;
     notificationsEnabled = false;
     pendingNotificationLength = 0;
     pendingNotificationOffset = 0;
     queuedControlNotificationLength = 0;
-    streamingEnabled = true;
+    streamingEnabled = false;
     sessionClockStarted = false;
     commandLength = 0;
     startAdvertising();
     break;
 
-  case sl_bt_evt_gatt_mtu_exchanged_id: {
+  case BleEvent::MtuExchanged: {
     // 交渉されたMTUから通知1回で送れるデータ量（MTU -
     // ATTヘッダー3バイト）を更新する。
-    const uint16_t mtu = event->data.evt_gatt_mtu_exchanged.mtu;
+    const uint16_t mtu = event->data.mtuExchanged.mtu;
     if (mtu > 3) {
       const uint16_t payloadSize = mtu - 3;
       notificationPayloadSize = payloadSize < maxNotificationPayloadSize
@@ -517,20 +608,19 @@ void handleBleEvent(sl_bt_msg_t *event) {
     break;
   }
 
-  case sl_bt_evt_gatt_server_characteristic_status_id: {
+  case BleEvent::CharacteristicStatus: {
     // C6がデータ特性の通知購読を有効/無効にした状態変化を反映する。
-    const sl_bt_evt_gatt_server_characteristic_status_t &status =
-        event->data.evt_gatt_server_characteristic_status;
+    const auto &status = event->data.characteristicStatus;
     if (status.connection == connectionHandle &&
         status.characteristic == sensorDataCharacteristicHandle &&
-        status.status_flags == sl_bt_gatt_server_client_config) {
+        status.statusFlags == sl_bt_gatt_server_client_config) {
       notificationsEnabled =
-          status.client_config_flags == sl_bt_gatt_server_notification;
+          status.clientConfigFlags == sl_bt_gatt_server_notification;
       if (notificationsEnabled) {
-        // C6の通知購読が有効になった時点から、loop()がDATA行を送り始める。
+        // ACKの通知経路を先に有効にする。DATAはSTART/RESETを受けて開始する。
         sessionClockStarted = false;
         lastSensorSendUs = micros();
-        Serial.print("BLE notifications enabled; streaming sensor data\n");
+        Serial.print("BLE notifications enabled; waiting for START command\n");
         if (!imuReady) {
           sendNotificationText("ERROR,IMU_NOT_READY\n", true);
         }
@@ -544,14 +634,19 @@ void handleBleEvent(sl_bt_msg_t *event) {
     break;
   }
 
-  case sl_bt_evt_gatt_server_attribute_value_id: {
+  case BleEvent::AttributeValue: {
     // C6からデータ特性へ書き込まれたバイト列を受け取り、改行区切りコマンドとして処理する。
-    const sl_bt_evt_gatt_server_attribute_value_t &value =
-        event->data.evt_gatt_server_attribute_value;
+    const auto &value = event->data.attributeValue;
     if (value.attribute == sensorDataCharacteristicHandle) {
+      if (value.truncated) {
+        // 切り詰めた先頭部分にCMDが含まれていても、行全体を実行せず破棄する。
+        commandLength = 0;
+        Serial.print("ERROR: BLE command is too long; discarded\n");
+        break;
+      }
       // C6から届くコマンドは改行区切り。分割された書き込みも1文字ずつ蓄積する。
-      for (uint8_t i = 0; i < value.value.len; ++i) {
-        processCommandByte(value.value.data[i]);
+      for (uint8_t i = 0; i < value.length; ++i) {
+        processCommandByte(value.data[i]);
       }
     }
     break;

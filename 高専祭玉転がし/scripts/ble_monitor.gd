@@ -28,6 +28,23 @@ const MOCHA_PEACH := Color("#fab387")
 const MOCHA_MAUVE := Color("#cba6f7")
 const MOCHA_RED := Color("#f38ba8")
 
+# RESET/起動からこの秒数待ってMG24へSTOPを送る（既定180秒 = 3分）。
+@export_range(0.0, 3600.0, 1.0) var mg24_stop_delay_seconds := 180.0
+
+enum GameState { WAITING, WAKING, PLAYING }
+var game_state := GameState.WAITING
+var idle_seconds := 0.0
+var stop_retry_seconds := 0.0
+var stop_confirmed := false
+var wake_command_sent := false
+var wake_bridge_ready := false
+var button_link_pending := false
+var show_resume_prompt := false
+var waiting_overlay: Control
+var waiting_title: Label
+var waiting_connection: Label
+var game_button: Button
+
 var serial_process: Dictionary = {}
 var serial_stdio: FileAccess
 var serial_stderr: FileAccess
@@ -52,6 +69,7 @@ var ball_status_elapsed := 0.0
 var latest_sensor_fields := PackedStringArray()
 var last_sensor_receive_usec := 0
 var sensor_period_ms := 0.0
+var first_sensor_data_logged := false
 
 var command_select: OptionButton
 var send_button: Button
@@ -75,6 +93,7 @@ func _ready() -> void:
 	# 台の物理更新より先に最新のシリアル入力を取り込む。
 	process_physics_priority = -100
 	_build_ui()
+	_update_waiting_overlay()
 	port_input.text = _find_default_serial_port()
 	if not port_input.text.is_empty():
 		_connect_serial()
@@ -85,9 +104,10 @@ func _ready() -> void:
 		connection_panel_button.set_pressed_no_signal(true)
 
 
-func _physics_process(_delta: float) -> void:
+func _physics_process(delta: float) -> void:
 	# 120 Hzの物理tickで受信を確認する。姿勢の反映は同じtick内。
 	_poll_serial()
+	_update_game_state(delta)
 	var sensor_fresh := sensor_pose_available and Time.get_ticks_usec() - last_sensor_receive_usec < SENSOR_STALE_USEC
 	if ble_link_ready:
 		var link_text := "●  BLEデータ受信中" if sensor_fresh else "●  BLE接続済み・データ待ち"
@@ -97,8 +117,8 @@ func _physics_process(_delta: float) -> void:
 				"font_color", MOCHA_GREEN if sensor_fresh else MOCHA_YELLOW
 			)
 	var focus := get_viewport().gui_get_focus_owner()
-	ball_game.keyboard_enabled = not sensor_fresh and not (focus is LineEdit)
-	ball_game.set_sensor_angular_velocity(sensor_angular_velocity if sensor_fresh else Vector3.ZERO)
+	ball_game.keyboard_enabled = game_state == GameState.PLAYING and not sensor_fresh and not (focus is LineEdit)
+	ball_game.set_sensor_angular_velocity(sensor_angular_velocity if sensor_fresh and game_state == GameState.PLAYING else Vector3.ZERO)
 	if is_instance_valid(sensor_orientation_status_label):
 		sensor_orientation_status_label.text = "● RAW SENSOR" if sensor_fresh else "センサーデータを待っています"
 	if not sensor_fresh and focus is LineEdit:
@@ -117,6 +137,7 @@ func _process(delta: float) -> void:
 		ball_status_label.text = ball_game.get_game_status() + "  |  %.2f m/秒" % ball_game.ball.linear_velocity.length()
 		_update_stats()
 		_refresh_sensor_labels()
+		_update_waiting_overlay()
 
 
 func _build_ui() -> void:
@@ -173,15 +194,15 @@ func _build_ui() -> void:
 	game_controls.position = Vector2(-482, 88)
 	game_controls.size = Vector2(458, 52)
 	overlay.add_child(game_controls)
-	var reset_ball_button := Button.new()
-	reset_ball_button.text = "もう一度"
-	reset_ball_button.pressed.connect(func() -> void: ball_game.reset_ball())
-	_style_game_button(reset_ball_button, MOCHA_MAUVE)
-	game_controls.add_child(reset_ball_button)
+	game_button = Button.new()
+	game_button.text = "スタート"
+	game_button.pressed.connect(_on_game_button_pressed)
+	_style_game_button(game_button, MOCHA_MAUVE)
+	game_controls.add_child(game_button)
 	var overview_button := Button.new()
 	overview_button.text = "全体を見る"
 	overview_button.toggle_mode = true
-	hhhhhhoverview_button.toggled.connect(func(enabled: bool) -> void: ball_game.overview_enabled = enabled)
+	overview_button.toggled.connect(func(enabled: bool) -> void: ball_game.overview_enabled = enabled)
 	_style_game_button(overview_button, MOCHA_TEAL)
 	game_controls.add_child(overview_button)
 
@@ -304,6 +325,131 @@ func _build_ui() -> void:
 	log_output.add_theme_font_size_override("normal_font_size", 12)
 	log_output.add_theme_color_override("default_color", MOCHA_SUBTEXT)
 	settings_layout.add_child(log_output)
+	_create_waiting_overlay()
+	# 待機中も接続設定と画面のボタンは操作できるよう、案内より手前に置く。
+	top_right.reparent(self)
+	game_controls.reparent(self)
+	connection_panel.reparent(self)
+
+
+func _create_waiting_overlay() -> void:
+	waiting_overlay = Control.new()
+	waiting_overlay.name = "WaitingOverlay"
+	waiting_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	waiting_overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(waiting_overlay)
+	var blur := ColorRect.new()
+	blur.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	blur.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var blur_material := ShaderMaterial.new()
+	blur_material.shader = preload("res://shaders/waiting_blur.gdshader")
+	blur.material = blur_material
+	waiting_overlay.add_child(blur)
+	var center := CenterContainer.new()
+	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	waiting_overlay.add_child(center)
+	var layout := VBoxContainer.new()
+	layout.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	layout.add_theme_constant_override("separation", 24)
+	center.add_child(layout)
+	waiting_title = Label.new()
+	waiting_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	waiting_title.add_theme_font_size_override("font_size", 54)
+	waiting_title.add_theme_color_override("font_color", MOCHA_TEXT)
+	layout.add_child(waiting_title)
+	waiting_connection = Label.new()
+	waiting_connection.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	waiting_connection.add_theme_font_size_override("font_size", 22)
+	waiting_connection.add_theme_color_override("font_color", MOCHA_TEAL)
+	layout.add_child(waiting_connection)
+
+
+func _on_game_button_pressed() -> void:
+	button_link_pending = false
+	if game_state == GameState.PLAYING:
+		_enter_waiting()
+	elif game_state == GameState.WAITING:
+		if not show_resume_prompt:
+			_enter_waiting()
+			return
+		game_state = GameState.WAKING
+		wake_command_sent = false
+		wake_bridge_ready = false
+		_clear_sensor_state()
+		_update_waiting_overlay()
+	# 復帰中の連打では準備を中断せず、DATAの到着を待つ。
+
+
+func _enter_waiting() -> void:
+	game_state = GameState.WAITING
+	show_resume_prompt = true
+	idle_seconds = 0.0
+	stop_retry_seconds = 0.0
+	stop_confirmed = false
+	wake_command_sent = false
+	wake_bridge_ready = false
+	button_link_pending = false
+	ball_game.reset_ball()
+	_update_waiting_overlay()
+
+
+func _update_game_state(delta: float) -> void:
+	if game_state == GameState.WAITING:
+		# C6が押下を保持してBLE接続中。GAMERESETが届くまで操作を進めない。
+		if button_link_pending:
+			return
+		idle_seconds += delta
+		stop_retry_seconds -= delta
+		if idle_seconds >= mg24_stop_delay_seconds and not stop_confirmed and stop_retry_seconds <= 0.0:
+			# BLE切断中でもC6がSTOPを保持し、再接続したMG24へ適用する。
+			if _write_bridge_command("STOP"):
+				stop_retry_seconds = 1.0
+	elif game_state == GameState.WAKING:
+		if not wake_command_sent:
+			wake_command_sent = _write_bridge_command("START")
+		if wake_bridge_ready and sensor_pose_available and Time.get_ticks_usec() - last_sensor_receive_usec < SENSOR_STALE_USEC:
+			game_state = GameState.PLAYING
+			stop_confirmed = false
+			ball_game.start_ball()
+			ball_game.set_target_tilt(current_sensor_pitch, current_sensor_roll)
+			_update_waiting_overlay()
+
+
+func _update_waiting_overlay() -> void:
+	waiting_overlay.visible = game_state != GameState.PLAYING
+	game_button.disabled = game_state == GameState.WAKING
+	game_button.text = "リセット" if game_state == GameState.PLAYING else ("再開" if show_resume_prompt else "スタート")
+	if game_state == GameState.WAKING or button_link_pending:
+		waiting_title.text = "開始の準備中…"
+		if not connected_to_device:
+			waiting_connection.text = "C6のUSB接続を待っています"
+		elif not ble_link_ready:
+			waiting_connection.text = "MG24とBLE接続中…"
+		elif button_link_pending:
+			waiting_connection.text = "BLE接続済み · C6のボタン通知を待っています…"
+		elif not wake_bridge_ready:
+			waiting_connection.text = "BLE接続済み · MG24のSTART応答とデータを待っています…"
+		else:
+			waiting_connection.text = "BLE接続済み · 新しいセンサーデータを待っています…"
+	else:
+		waiting_title.text = "もう一度押して再開" if show_resume_prompt else "ボタンを押してスタート"
+		if stop_confirmed:
+			waiting_connection.text = "MG24は通信休止中 · ボタンで復帰します"
+		elif idle_seconds >= mg24_stop_delay_seconds:
+			waiting_connection.text = "MG24の通信を停止しています…"
+		else:
+			waiting_connection.text = "待機が続くと %.0f 秒後にMG24の通信を停止します" % ceil(mg24_stop_delay_seconds - idle_seconds)
+
+
+func _write_bridge_command(command: String) -> bool:
+	if not connected_to_device or serial_stdio == null:
+		return false
+	serial_stdio.store_string("CMD,%s\n" % command)
+	serial_stdio.flush()
+	commands_sent += 1
+	_log("C6へコマンド送信: %s" % command)
+	return true
 
 func _set_panel_rect(panel: Control, left: float, top: float, right: float, bottom: float, offsets: Vector4) -> void:
 	panel.anchor_left = left
@@ -411,9 +557,27 @@ func _apply_game_theme() -> void:
 
 
 func _find_default_serial_port() -> String:
+	# USB番号順ではMG24を先に開く場合があるため、Arduinoのボード識別を優先する。
+	var peripheral_ports: Array[String] = []
+	var cli := _find_arduino_cli()
+	if not cli.is_empty():
+		var output: Array = []
+		if OS.execute(cli, ["board", "list", "--format", "json"], output) == 0 and not output.is_empty():
+			var discovery: Variant = JSON.parse_string(str(output[0]))
+			if discovery is Dictionary:
+				for detected in discovery.get("detected_ports", []):
+					var address: String = detected.get("port", {}).get("address", "")
+					for board in detected.get("matching_boards", []):
+						var fqbn: String = board.get("fqbn", "")
+						if fqbn.begins_with("esp32:esp32:"):
+							return address
+						if fqbn.begins_with("SiliconLabs:silabs:"):
+							peripheral_ports.append(address)
 	var entries := DirAccess.get_files_at("/dev")
 	var candidates: Array[String] = []
 	for entry in entries:
+		if "/dev/" + entry in peripheral_ports:
+			continue
 		if entry.begins_with("cu.usbmodem") or entry.begins_with("cu.wchusbserial"):
 			candidates.append("/dev/" + entry)
 		elif entry.begins_with("ttyACM") or entry.begins_with("ttyUSB"):
@@ -591,7 +755,29 @@ func _ingest_serial_bytes(data: PackedByteArray) -> void:
 
 
 func _handle_serial_line(line: String) -> void:
-	if line.begins_with("RX,"):
+	if line == "GAMERESET" or line == "RX,GAMERESET":
+		# pollGameResetPin()によるC6側の押下通知が物理ボタン操作の入口。
+		_on_game_button_pressed()
+	elif line == "GAME,BUTTON_PENDING":
+		ble_link_ready = false
+		wake_bridge_ready = false
+		button_link_pending = true
+		_update_waiting_overlay()
+	elif line == "GAME,WAKING":
+		ble_link_ready = false
+		wake_bridge_ready = false
+	elif line == "GAME,READY":
+		ble_link_ready = true
+		if game_state == GameState.WAKING and wake_command_sent:
+			wake_bridge_ready = true
+	elif line == "GAME,SLEEPING":
+		ble_link_ready = false
+		_clear_sensor_state()
+		connection_status_label.text = "●  BLE休止中"
+		connection_status_label.add_theme_color_override("font_color", MOCHA_SUBTEXT)
+		if game_state == GameState.WAITING and idle_seconds >= mg24_stop_delay_seconds:
+			stop_confirmed = true
+	elif line.begins_with("RX,"):
 		notifications_received += 1
 		_handle_serial_message(line.trim_prefix("RX,"))
 	elif line.contains("BLE subscribed; bidirectional GATT ready"):
@@ -606,7 +792,8 @@ func _handle_serial_line(line: String) -> void:
 		_set_status("BLE接続後にDATAが届かず、C6が再接続しています。")
 	elif line.contains("GATT disconnect event") or line.contains("BLE disconnected; will rescan"):
 		ble_link_ready = false
-		send_button.disabled = true
+		wake_bridge_ready = false
+		send_button.disabled = not connected_to_device
 		connection_status_label.text = "●  BLE再接続中"
 		connection_status_label.add_theme_color_override("font_color", MOCHA_YELLOW)
 		_set_status("MG24とのBLE切断。C6が再接続しています…")
@@ -616,23 +803,22 @@ func _handle_serial_line(line: String) -> void:
 
 
 func _send_command() -> void:
-	if not connected_to_device or not ble_link_ready or serial_stdio == null:
-		_log("C6のシリアル接続とMG24とのBLEリンク確立後に送信してください。")
-		return
-	# CMD行をC6の標準入力へ書き、C6側がBLE Write Without ResponseでMG24へ届ける。
 	var command := command_select.get_item_text(command_select.selected)
-	serial_stdio.store_string("CMD,%s\n" % command)
-	serial_stdio.flush()
-	commands_sent += 1
-	_update_stats()
-	_log("C6へコマンド送信: %s" % command)
+	if command == "START" and game_state == GameState.WAITING:
+		_on_game_button_pressed()
+	elif command == "STOP":
+		_enter_waiting()
+		# 手動STOPは指定どおり即時に通信も停止する。
+		idle_seconds = mg24_stop_delay_seconds
+	else:
+		_write_bridge_command(command)
 
 
 func _set_connected(is_connected: bool) -> void:
 	var connection_changed := connected_to_device != is_connected
 	connected_to_device = is_connected
 	disconnected_notice.visible = true
-	send_button.disabled = not (is_connected and ble_link_ready)
+	send_button.disabled = not is_connected
 	if is_connected:
 		connection_status_label.text = "●  C6接続中 · BLE待機"
 		connection_status_label.add_theme_color_override("font_color", MOCHA_YELLOW)
@@ -642,6 +828,10 @@ func _set_connected(is_connected: bool) -> void:
 
 	if not is_connected:
 		ble_link_ready = false
+		wake_command_sent = false
+		wake_bridge_ready = false
+		stop_confirmed = false
+		button_link_pending = false
 		serial_receive_buffer.clear()
 		discarding_serial_line = false
 		last_sensor_timestamp = -1
@@ -665,6 +855,9 @@ func _handle_serial_message(message: String) -> void:
 		var was_fresh := sensor_pose_available and Time.get_ticks_usec() - last_sensor_receive_usec < SENSOR_STALE_USEC
 		if not _update_telemetry(message):
 			return
+		if not first_sensor_data_logged:
+			_log("MG24センサーデータ受信開始: %s" % message)
+			first_sensor_data_logged = true
 		ble_link_ready = true
 		send_button.disabled = false
 		if not was_fresh:
@@ -676,7 +869,9 @@ func _handle_serial_message(message: String) -> void:
 			last_sensor_timestamp = -1
 			integrated_yaw = 0.0
 			_clear_sensor_state()
-			ball_game.reset_ball()
+			_enter_waiting()
+		elif response == "STOP" and game_state == GameState.WAITING:
+			stop_confirmed = true
 		_log("MG24からの応答: %s" % response)
 		messages_received += 1
 	elif message.begins_with("ERROR,"):

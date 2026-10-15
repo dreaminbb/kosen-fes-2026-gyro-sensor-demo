@@ -38,6 +38,7 @@ var fall_count := 0
 var checkpoint_index := 0
 var elapsed_seconds := 0.0
 var race_started := false
+var waiting_for_start := true
 var completed := false
 var keyboard_enabled := true
 var overview_enabled := false
@@ -50,9 +51,12 @@ var sensor_angular_velocity := Vector3.ZERO
 func _ready() -> void:
 	_create_platform()
 	_create_ball()
+	reset_ball()
 
 
 func _physics_process(delta: float) -> void:
+	if waiting_for_start:
+		return
 	if keyboard_enabled and not completed:
 		# BLE未接続時も方向キーで遊べる。↑は奥（-Z）、←は左（-X）へ転がす。
 		var pitch_input := float(Input.is_key_pressed(KEY_DOWN)) - float(Input.is_key_pressed(KEY_UP))
@@ -115,15 +119,13 @@ func _process(_delta: float) -> void:
 
 
 func set_target_tilt(pitch: float, roll: float) -> void:
-	if completed:
+	if completed or waiting_for_start:
 		return
 	var limit := deg_to_rad(MAX_TILT_DEGREES)
 	# Pitch/Rollのみ反映。Yawの積分誤差でコースが回り続けるのを防ぐ。
 	target_rotation = Basis.from_euler(Vector3(
 		clampf(pitch, -limit, limit), 0.0, clampf(roll, -limit, limit)
 	)).get_rotation_quaternion()
-	if absf(pitch) > 0.02 or absf(roll) > 0.02:
-		race_started = true
 
 
 func set_sensor_angular_velocity(angular_velocity: Vector3) -> void:
@@ -133,7 +135,8 @@ func set_sensor_angular_velocity(angular_velocity: Vector3) -> void:
 
 
 func reset_ball() -> void:
-	# 手動リスタートは時間・チェックポイント・落下回数をすべて戻す。
+	# RESETではスタート上空に固定し、次のボタンとBLEの準備完了を待つ。
+	waiting_for_start = true
 	completed = false
 	race_started = false
 	elapsed_seconds = 0.0
@@ -141,13 +144,27 @@ func reset_ball() -> void:
 	checkpoint_index = 0
 	respawn_position = START_POSITION
 	target_rotation = Quaternion.IDENTITY
-	ball.freeze = false
+	platform.transform = Transform3D.IDENTITY
+	platform.reset_physics_interpolation()
+	ball.hold_at(START_POSITION + Vector3.UP * (FLOOR_THICKNESS * 0.5 + BALL_DROP_HEIGHT))
+	set_sensor_angular_velocity(Vector3.ZERO)
 	for marker in checkpoint_markers:
 		marker.material_override = _make_material(MOCHA_YELLOW, true)
+	camera_snap = true
+
+
+func start_ball() -> void:
+	if not waiting_for_start:
+		return
+	waiting_for_start = false
+	race_started = true
+	ball.freeze = false
 	_drop_ball()
 
 
 func get_game_status() -> String:
+	if waiting_for_start:
+		return "START上空で待機中  |  ボタンを押して開始"
 	if completed:
 		return "GOAL!  %.1f秒  |  落下 %d回  —「もう一度」で再挑戦" % [elapsed_seconds, fall_count]
 	var stage: String = ["蛇行する壁", "細い橋", "左右にずれる精密橋", "最後の区間 → GOAL"][checkpoint_index]

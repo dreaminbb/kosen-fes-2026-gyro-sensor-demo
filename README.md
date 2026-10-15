@@ -27,7 +27,7 @@
 対象基板はSeeed Studio XIAO MG24 (Sense)。現ファームウェアではLSM6DS3の実測加速度（g）と角速度（度/秒）を100 Hzで送る。
 
 ```c
-constexpr unsigned long SENSOR_SEND_INTERVAL_MS = 10;  // 10 ms = 100 Hz
+constexpr unsigned long SENSOR_SEND_INTERVAL_US = 10000;  // 10 ms = 100 Hz
 ```
 
 
@@ -120,28 +120,29 @@ getfacl /dev/ttyACM0 /dev/ttyACM1 "$mg24_usb"
 
 ### データの受診
 
-`高専祭玉転がし/scripts/ble_monitor.gd` がC6の `RX,DATA,...` を解析し、加速度XYZから求めたPitch/Rollで台を傾ける。初回の受信姿勢を水平の基準とし、「水平を合わせる」で現在のセンサー姿勢を基準に取り直せる。Yawは数値表示に使い、台の傾きには反映しない。
+`高専祭玉転がし/scripts/ble_monitor.gd` がC6の `RX,DATA,...` を解析し、加速度XYZから求めたPitch/Rollをそのまま台の傾きに使う。水平校正は行わず、Yawは数値表示に使い、台の傾きには反映しない。START上空での待機中は台を水平に固定する。
 
 ### コースとルール
 
-`scripts/ball_platform.gd` が長さ32 m・幅8 mのコースを生成する。START（Z=14 m）からGOAL（Z=-14 m）へ進む。
+`scripts/ball_platform.gd` が長さ56 m・幅8 mのコースを生成する。START（Z=24 m）からGOAL（Z=-26 m）へ進む。
 
 1. 左右の開口を交互に通るオレンジの壁。
-2. 紫の柱を避け、右寄りの幅1.8 m・長さ3 mの橋を渡る。橋の左右には床も見えない衝突形状もなく、球は落下する。
-3. 最後の柱を避けて緑のGOALリングへ入る。
+2. 紫の柱を避け、中央の幅2.4 m・長さ10 mの橋を渡る。橋の左右には床も見えない衝突形状もなく、球は落下する。
+3. 左右へずれる幅2.8 mの足場を渡る。
+4. 最後の柱を避けて緑のGOALリングへ入る。
 
-黄色い線が2か所のチェックポイント。順番に通過すると緑になり、落下後の再開地点になる。2か所を通過してGOALへ入るとクリアし、球を停止して時間・落下回数を表示する。「もう一度」で最初から再挑戦できる。
+黄色い線が3か所のチェックポイント。順番に通過すると緑になり、落下後の再開地点になる。3か所を通過してGOALへ入るとクリアし、球を停止して時間・落下回数を表示する。RESETボタンで最初から再挑戦できる。
 
 ### パラメータ
 
 Godotの1単位を1 mとして扱う。
 
 - 床の厚さ: 0.2 m。球の半径: 0.22 m、質量: 0.5 kg。
-- Pitch/Roll: 各軸±18°まで。係数48/秒の指数補間で追従（時定数約21 ms）。
+- Pitch/Roll: 各軸±18°まで。係数40/秒の指数補間で追従（時定数25 ms）。
 - 摩擦係数: 台・球とも0.65。球の反発係数: 0.1。
 - 物理エンジン: Jolt Physics、120 Hz。物理補間を有効にする。
 - 操作開始からの経過時間、現在の区間、チェックポイント、落下回数、速度（m/秒）を表示。
-- カメラは補間済みの球位置を追い、進行方向の少し先を映す。「コース全体」で俯瞰表示へ切り替えられる。
+- カメラは補間済みの球位置を追い、進行方向の少し先を映す。「全体を見る」で俯瞰表示へ切り替えられる。
 - Godotは全画面で起動する。ゲーム画面を全面に表示し、レース状況・操作案内・センサー値を重ねたパネルで表示する。シリアルポート・BLEコマンド・受信ログは「接続設定」パネルにまとめる。UIと3Dコースの色はCatppuccin Mochaを使う。
 
 ### 物理演算
@@ -150,7 +151,11 @@ Godotの1単位を1 mとして扱う。
 
 球がコースの床より3 m下に落ちる、またはコースのX/Z境界から3 m外へ出ると、最後のチェックポイント（未通過ならSTART）の1.8 m上から再出現する。判定と再開地点は傾いた台の座標系で計算する。`scripts/rolling_ball.gd` の `_integrate_forces()` で位置・姿勢・直線速度・角速度をリセットし、重力で台へ落とす。
 
-「もう一度」は時間・チェックポイント・落下回数をリセットする。MG24からの `ACK,RESET` では水平基準とゲームを両方リセットする。BLE切断や250 msのデータ停止時は方向キー操作へ切り替わり、キーを押していなければ台が水平に戻る。ポート入力中は方向キーで台を動かさない。
+RESETボタンは2段階で動く。1回目で時間・チェックポイント・落下回数をリセットし、水平なSTARTの床上1.8 mに玉を固定する。2回目でMG24の準備完了を確認して玉を落とし、計時を始める。起動時も1回目は準備、2回目は開始となる。画面の「スタート」「再開」「リセット」も同じ操作で、待機中は画面を少しぼかして中央に案内を表示する。MG24からの `ACK,RESET` でもゲームを待機状態へ戻す。
+
+待機状態に入ってから180秒（3分）後、Godotが `CMD,STOP` を送る。変更する場合は `scripts/ble_monitor.gd` のエクスポート変数 `mg24_stop_delay_seconds`、またはシーンのInspectorで設定する。待機中は玉の固定・計時停止を継続し、センサーを動かしても停止までの時間は延長しない。STOP応答後はC6もBLEを切断して探索を止める。次のボタンで再接続し、START応答とその後のDATAをC6が確認した `GAME,READY`、およびGodotの新しい姿勢データが揃ってから開始する。USBシリアルは休止中も維持する。
+
+実行中は、BLE切断や250 msのデータ停止時に方向キー操作へ切り替わり、キーを押していなければ台が水平に戻る。ポート入力中は方向キーで台を動かさない。
 
 ### 更新周期
 
@@ -160,7 +165,7 @@ Godotは台の物理処理より前に120 Hzの物理tickでパイプを読み�
 
 ### 動作確認
 
-Godot 4.7.2 / Jolt Physics / Metalで、STARTへの着地、壁との実際の衝突、橋の左右からの落下、橋上への着地、2か所のチェックポイント、傾いた台への再出現、GOAL・リスタートを確認した。10°の入力に約58 ms以内で90%以上追従することと、DATA入力・RESETの反映も確認した。実機を手で傾けた際の各軸の方向と体感遅延の確認は未実施。
+旧コースの検証記録: Godot 4.7.2 / Jolt Physics / Metalで、STARTへの着地、壁との実際の衝突、橋の左右からの落下、橋上への着地、当時の2か所のチェックポイント、傾いた台への再出現、GOAL・リスタートを確認した。10°の入力に約58 ms以内で90%以上追従することと、DATA入力・RESETの反映も確認した。今回のRESET・休止復帰の検証は末尾に記載する。
 
 ---
 
@@ -182,16 +187,16 @@ arduino-cli config add board_manager.additional_urls \
   https://espressif.github.io/arduino-esp32/package_esp32_index.json
 
 # ボード定義
-rduino-cli core update-index
+arduino-cli core update-index
 arduino-cli core install SiliconLabs:silabs@5.0.0
 arduino-cli core install esp32:esp32@3.3.12
 
 # MG24のIMUライブラリ
 arduino-cli lib install "Seeed Arduino LSM6DS3"
 
-LinuxのUSB権限も一度だけ設定します。shin はLinuxユーザー名に置き換えてください。
+# LinuxのUSB権限も一度だけ設定します。<user>はLinuxユーザー名に置き換えます。
 
-sudo usermod -aG uucp shin
+sudo usermod -aG uucp <user>
 printf '%s\n' 'SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2886", ATTR{idProduct}=="0062", MODE="0660", GROUP="uucp"' \
   | sudo tee /etc/udev/rules.d/70-xiao-mg24.rules
 sudo udevadm control --reload-rules
@@ -263,7 +268,7 @@ MG24が最短の接続間隔7.5 ms（BLE単位6）を要求する。実際に適
 
 Godotは120 Hzの物理tickで、台の更新より先にパイプを8192 bytesずつ読み、1回・1パイプにつき最大65536 bytesを処理する。UTF-8は完全な行になってから文字列へ変換する。姿勢表示は指数補間（係数40/秒、時定数約25 ms）で100 Hzの入力へ追従する。文字表示だけを10 Hzに抑え、姿勢計算と台の更新は即時に行う。C6は通知コールバックでシリアル出力せず、最新の完成行をloop()からUSBへ渡す。USB出力が詰まってもBLEイベントタスクを待たせず、`Serial.write()` が一部しか書けないときは残りを保持する。ACKとERRORはDATAより優先する。
 
-MG24の `sl_bt_on_event()` はイベントのコピーをFreeRTOSキューへ入れてすぐに戻る。GATT登録、接続設定、ログの整形、コマンド処理は `loop()` のArduinoタスクで実行する。Silicon Labsコア5.0.0のBluetoothイベントタスクはスタックが1000 bytesで、そこで浮動小数点の `Serial.printf()` を実行するとHardFaultが発生した。実機では接続直後にMG24が停止し、C6ではサービス探索中の切断と `sensor service not found` が出ていた。
+MG24の `sl_bt_on_event()` は必要な項目だけを `BleEvent` にコピーしてFreeRTOSキューへ入れ、すぐに戻る。SDKイベント全体の最大属性バッファは保持せず、コマンドは64 bytesを上限にコピーする。切り詰めが発生した属性値はコマンドとして実行せず破棄する。GATT登録、接続設定、ログの整形、コマンド処理は `loop()` のArduinoタスクで実行する。Silicon Labsコア5.0.0のBluetoothイベントタスクはスタックが1000 bytesで、そこで浮動小数点の `Serial.printf()` を実行するとHardFaultが発生した。実機では接続直後にMG24が停止し、C6ではサービス探索中の切断と `sensor service not found` が出ていた。
 
 C6は接続先のサービスUUID一致を必須とする。接続後のサービス探索中に切断された場合は、サービスが存在しない場合と区別してログへ出す。MG24側の切断ログにはBluetoothスタックのreasonコードを表示する。
 
@@ -273,8 +278,22 @@ C6 Centralをコンパイルする:
 
 C6の接続、サービス探索、通知購読はNimBLEのAPIを直接使用する。Arduino-ESP32の `BLEClient.cpp` にはMTU重複交換時の接続失敗と、通知の最初のmbufだけを渡す問題があった。C6はそのクラスを使用せず、通知全体を `OS_MBUF_PKTLEN` と `os_mbuf_copydata` で読み取る。ボードパッケージ内のファイルを書き換える補助スクリプトは不要。
 
-C6は接続後に `CMD,RESET` を自動送信し、MG24からの `ACK,RESET` と `DATA,...` をUSBシリアルへ出力する。通知購読後、送信が期待される状態で2秒間DATAが届かなければ再接続する。Godotは `arduino-cli monitor` の標準入出力を読み書きし、同じ `CMD,START`、`CMD,STOP`、`CMD,RESET` をC6へ送る。手動で試す場合はGodotを閉じ、C6のシリアルモニターからこれらのコマンドを1行ずつ送る。
+C6は接続後に `CMD,START` を自動送信する。再接続だけでゲームがリセットされないよう、自動の `CMD,RESET` は送らない。通知購読後、送信が期待される状態で2秒間DATAが届かなければ再接続する。START/STOP/RESETの応答がなければ500 ms間隔で再送し、2秒で再接続する。Godotは `arduino-cli monitor` の標準入出力を読み書きし、同じ `CMD,START`、`CMD,STOP`、`CMD,RESET` をC6へ送る。BLE接続中でなくてもコマンドを受け付け、希望状態を接続後に適用する。手動で試す場合はGodotを閉じ、C6のシリアルモニターからこれらのコマンドを1行ずつ送る。
+
+物理ボタンはC6のD1（GPIO1）、旧配線互換のGPIO2のいずれかへ3.3 VのHIGHを入力する。既存の `pollGameResetPin()` で内部プルダウンと100 msのデバウンスを使用し、押し続けても1回の押下になる。C6はGATT接続・通知購読後に `RX,GAMERESET` をGodotへ送る。Godotの2段階操作はこの押下通知で進め、接続中の `GAME,BUTTON_PENDING` は状況表示だけに使う。探索は非同期で行うため、探索中もボタンを読み取れる。シリアルへ `GAMERESET` または `CMD,GAMERESET` を送ると同じ操作を試せる。USBイベントとGATTプロトコルの詳細は [通信方式](document/通信方式.md) を参照。
 
 
 ### godbotの操作
 フォルダ`高専祭玉転がし/`がgodotのプロジェクトファイルであり、godotを開きプロジェクトをインポートすると既存のコードベース、データを読み込んでくれる。
+
+rebase先とreflog上の実装を比較した採用判断は [変更統合メモ](document/変更統合メモ.md) に記載する。
+
+実機を使わないゲーム状態・固定/落下・180秒タイマーの回帰確認:
+
+```sh
+godot --headless --path '高専祭玉転がし' --script res://tests/game_reset_test.gd
+```
+
+2026-10-15の検証: XIAO MG24 (Sense) / XIAO ESP32-C6をそれぞれSilicon Labs 5.0.0 / ESP32 3.3.12でコンパイル・書き込み済み。実機BLEとC6のUSBシリアルで約100 HzのDATA、STOP後のDATA・探索停止、GATT再接続、START応答、READYを確認した。Godot 4.7.2 / Jolt / Vulkanの実描画でも、USBの疑似ボタン入力から準備・休止・復帰・落下・再リセットを2回連続で確認した。実機の停止タイマーはテスト時だけ1秒に短縮し、既定180秒の境界は上記の回帰テストで確認した。物理GPIOボタンの実押下とセンサー各軸の方向は今回未確認。
+
+その後の物理ボタン経路の修正（`RX,GAMERESET` だけで操作を進め、接続状況通知では開始しない）は、C6のコンパイルとGodotの回帰テストで確認済み。修正後のC6への書き込み・実機再確認は、C6がUSBで未検出となったため未実施。

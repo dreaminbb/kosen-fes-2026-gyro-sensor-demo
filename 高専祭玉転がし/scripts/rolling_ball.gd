@@ -26,6 +26,16 @@ func request_respawn(new_position: Vector3) -> void:
 	sleeping = false
 
 
+func hold_at(new_position: Vector3) -> void:
+	# freeze中は_integrate_forces()が呼ばれないため、固定時に直接位置を戻す。
+	freeze = true
+	respawn_pending = false
+	linear_velocity = Vector3.ZERO
+	angular_velocity = Vector3.ZERO
+	global_transform = Transform3D(Basis.IDENTITY, new_position)
+	reset_physics_interpolation()
+
+
 func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	if not respawn_pending:
 		return

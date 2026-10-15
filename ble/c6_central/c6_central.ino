@@ -11,6 +11,7 @@
 #include <host/ble_gatt.h>
 #include <host/ble_hs.h>
 #include <host/ble_hs_id.h>
+#include <math.h>
 #include <string.h>
 
 namespace {
@@ -23,6 +24,18 @@ constexpr char kDataCharacteristicUuid[] =
 constexpr size_t NOTIFICATION_LINE_CAPACITY = 160;
 constexpr size_t SERIAL_FRAME_CAPACITY = 160;
 constexpr unsigned long DATA_TIMEOUT_MS = 2000;
+constexpr unsigned long COMMAND_RETRY_MS = 500;
+// 参照実装6595056と同じ配線。D1(GPIO1)、旧配線GPIO2の3.3 V HIGHを検出する。
+constexpr uint8_t GAMERESET_GPIO = 1;
+constexpr uint8_t GAMERESET_LEGACY_GPIO = 2;
+constexpr unsigned long GAMERESET_DEBOUNCE_MS = 100;
+bool rawGameResetHigh = false;
+bool stableGameResetHigh = false;
+unsigned long gameResetChangedMs = 0;
+bool gameButtonPending = false;
+bool centralSleeping = false;
+bool scanInProgress = false;
+std::atomic<bool> scanCompleted{false};
 
 BLEScan *scanner = nullptr;
 BLEAddress peerAddress;
@@ -32,8 +45,16 @@ BLEUUID cccdUuid(static_cast<uint16_t>(0x2902));
 uint8_t peerAddressType = 0;
 bool peerFound = false;
 bool connected = false;
-bool initialCommandSent = false;
 bool streamingExpected = true;
+// 送信希望は切断をまたいで保持し、再接続後もSTOP/STARTを再適用する。
+enum class StreamCommand : uint8_t { none, start, stop, reset };
+StreamCommand pendingStreamCommand = StreamCommand::start;
+std::atomic<StreamCommand> acknowledgedCommand{StreamCommand::none};
+std::atomic<bool> dataAfterStartAck{false};
+bool streamWanted = true;
+bool commandAttempted = false;
+unsigned long lastCommandAtMs = 0;
+unsigned long firstCommandAtMs = 0;
 enum class LinkState : uint8_t {
   idle,
   connecting,
@@ -53,7 +74,6 @@ uint16_t serviceEndHandle = 0;
 uint16_t dataHandle = 0;
 uint16_t cccdHandle = 0;
 unsigned long linkStartedAtMs = 0;
-unsigned long connectedAtMs = 0;
 char serialCommand[16];
 size_t serialCommandLength = 0;
 char notificationLine[NOTIFICATION_LINE_CAPACITY];
@@ -67,6 +87,7 @@ size_t serialOutputFrameLength = 0;
 size_t serialOutputFrameOffset = 0;
 portMUX_TYPE serialFrameMux = portMUX_INITIALIZER_UNLOCKED;
 std::atomic<unsigned long> lastDataFrameMs{0};
+unsigned long lastInvalidDataLogMs = 0;
 
 void enqueueSerialFrame(const char *line) {
   const size_t lineLength = strlen(line);
@@ -135,14 +156,56 @@ void receiveNotification(const uint8_t *data, size_t length) {
       if (!discardingNotificationLine && notificationLineLength > 0) {
         notificationLine[notificationLineLength] = '\0';
         if (strncmp(notificationLine, "DATA,", 5) == 0) {
-          size_t separators = 0;
-          for (size_t position = 0; position < notificationLineLength;
-               ++position) {
-            separators += notificationLine[position] == ',';
+          // READYはGodotが姿勢計算に使える完全なセンサーフレームを
+          // 確認してから出す。区切り数だけではゼロ値/不正値を誤認する。
+          char frame[NOTIFICATION_LINE_CAPACITY];
+          memcpy(frame, notificationLine, notificationLineLength + 1);
+          char *save = nullptr;
+          char *field = strtok_r(frame, ",", &save);
+          bool valid = field != nullptr && strcmp(field, "DATA") == 0;
+          field = strtok_r(nullptr, ",", &save);  // timestamp
+          valid = valid && field != nullptr;
+          char *end = nullptr;
+          if (valid) {
+            strtoull(field, &end, 10);
+            valid = end != field && *end == '\0';
           }
-          if (separators == 7) {
+          float accel[3] = {0.0f, 0.0f, 0.0f};
+          for (size_t axis = 0; axis < 6 && valid; ++axis) {
+            field = strtok_r(nullptr, ",", &save);
+            if (field == nullptr) {
+              valid = false;
+              break;
+            }
+            end = nullptr;
+            const float value = strtof(field, &end);
+            if (end == field || *end != '\0' || !isfinite(value)) {
+              valid = false;
+            } else if (axis < 3) {
+              accel[axis] = value;
+            }
+          }
+          valid = valid && strtok_r(nullptr, ",", &save) == nullptr &&
+                  (accel[0] * accel[0] + accel[1] * accel[1] +
+                   accel[2] * accel[2]) >= 0.0001f;
+          if (valid) {
             lastDataFrameMs.store(millis());
+            const StreamCommand ack = acknowledgedCommand.load();
+            if (ack == StreamCommand::start || ack == StreamCommand::reset) {
+              dataAfterStartAck.store(true);
+            }
+          } else {
+            if (millis() - lastInvalidDataLogMs >= 1000) {
+              printf("ERROR,MG24 DATA frame has invalid/zero acceleration\n");
+              lastInvalidDataLogMs = millis();
+            }
           }
+        } else if (strcmp(notificationLine, "ACK,START") == 0) {
+          acknowledgedCommand.store(StreamCommand::start);
+        } else if (strcmp(notificationLine, "ACK,STOP") == 0) {
+          acknowledgedCommand.store(StreamCommand::stop);
+        } else if (strcmp(notificationLine, "ACK,RESET") == 0) {
+          acknowledgedCommand.store(StreamCommand::reset);
         }
         enqueueSerialFrame(notificationLine);
       }
@@ -159,12 +222,26 @@ void receiveNotification(const uint8_t *data, size_t length) {
   }
 }
 
+void onScanCompleted(BLEScanResults results) {
+  (void)results;
+  scanCompleted.store(true);
+}
+
 bool scanForPeripheral() {
   // MG24はKosenBallという名前とセンサーサービスUUIDを含むアドバタイズを送信する。
-  printf("BLE scanning for %s\n", kDeviceName);
-  peerFound = false;
-  scanner->clearResults();
-  BLEScanResults *results = scanner->start(1, false);
+  if (!scanInProgress) {
+    printf("BLE scanning for %s\n", kDeviceName);
+    peerFound = false;
+    scanner->clearResults();
+    scanCompleted.store(false);
+    scanInProgress = scanner->start(1, onScanCompleted, false);
+    return false;
+  }
+  if (!scanCompleted.load()) {
+    return false;
+  }
+  scanInProgress = false;
+  BLEScanResults *results = scanner->getResults();
   if (results == nullptr) {
     printf("BLE scan returned no results\n");
     return false;
@@ -384,17 +461,17 @@ bool connectToPeripheral() {
   return true;
 }
 
-void sendCommand(const char *command, size_t length) {
+bool sendCommand(const char *command, size_t length) {
   if (!connected || connectionHandle.load() == BLE_HS_CONN_HANDLE_NONE ||
       dataHandle == 0 || length == 0) {
     printf("ERROR,BLE command requires an active connection\n");
-    return;
+    return false;
   }
 
   char packet[20];
   if (length + 1 > sizeof(packet) || length + 1 > 20) {
     printf("ERROR,command too long for one BLE write\n");
-    return;
+    return false;
   }
 
   memcpy(packet, command, length);
@@ -408,12 +485,106 @@ void sendCommand(const char *command, size_t length) {
                 memcmp(command, "CMD,START", length) == 0) ||
                (length == strlen("CMD,RESET") &&
                 memcmp(command, "CMD,RESET", length) == 0)) {
+      if (!streamingExpected) {
+        lastDataFrameMs.store(millis());
+      }
       streamingExpected = true;
-      lastDataFrameMs.store(millis());
     }
     printf("TX,%.*s\n", static_cast<int>(length), command);
+    return true;
   } else {
     printf("ERROR,BLE write failed\n");
+    return false;
+  }
+}
+
+void requestStreamCommand(StreamCommand command) {
+  streamWanted = command != StreamCommand::stop;
+  if (streamWanted) {
+    centralSleeping = false;
+  } else if (centralSleeping) {
+    // 休止中の再送には再接続せず、確認済みの状態を返す。
+    printf("GAME,SLEEPING\n");
+    return;
+  }
+  if (pendingStreamCommand == command && commandAttempted) {
+    return;
+  }
+  pendingStreamCommand = command;
+  acknowledgedCommand.store(StreamCommand::none);
+  dataAfterStartAck.store(false);
+  commandAttempted = false;
+}
+
+void serviceStreamCommand() {
+  const StreamCommand command = pendingStreamCommand;
+  if (command == StreamCommand::none) {
+    return;
+  }
+  if (acknowledgedCommand.load() == command) {
+    if (command == StreamCommand::stop) {
+      pendingStreamCommand = StreamCommand::none;
+      centralSleeping = true;
+      printf("GAME,SLEEPING\n");
+      linkState.store(LinkState::disconnecting);
+      linkStartedAtMs = millis();
+      ble_gap_terminate(connectionHandle.load(), BLE_ERR_REM_USER_CONN_TERM);
+      return;
+    }
+    // 書き込み成功や購読完了だけではゲームを開始しない。
+    // MG24からのACKに続いて新しい完全なDATAが届いて初めて通知する。
+    if (dataAfterStartAck.load()) {
+      pendingStreamCommand = StreamCommand::none;
+      if (command == StreamCommand::start) {
+        // 復帰途中に再切断しても、再接続ごとにGodotへ準備完了を知らせる。
+        printf("GAME,READY\n");
+      }
+    }
+    return;
+  }
+  if (commandAttempted && millis() - lastCommandAtMs < COMMAND_RETRY_MS) {
+    return;
+  }
+  const char *text = command == StreamCommand::stop ? "CMD,STOP" :
+                     command == StreamCommand::reset ? "CMD,RESET" : "CMD,START";
+  if (!commandAttempted) {
+    firstCommandAtMs = millis();
+  }
+  sendCommand(text, strlen(text));
+  commandAttempted = true;
+  lastCommandAtMs = millis();
+}
+
+void requestGameButton() {
+  // pollGameResetPin()の1押下を保持し、接続完了後にGAMERESETを1回だけ渡す。
+  if (gameButtonPending) {
+    return;
+  }
+  gameButtonPending = true;
+  if (centralSleeping || linkState.load() != LinkState::ready) {
+    // 接続状況の表示用。Godotのゲーム操作は後続のRX,GAMERESETで行う。
+    printf("GAME,BUTTON_PENDING\n");
+  }
+  if (!streamWanted || linkState.load() != LinkState::ready) {
+    requestStreamCommand(StreamCommand::start);
+  }
+}
+
+void pollGameResetPin() {
+  const bool high = digitalRead(GAMERESET_GPIO) == HIGH ||
+                    digitalRead(GAMERESET_LEGACY_GPIO) == HIGH;
+  if (high != rawGameResetHigh) {
+    rawGameResetHigh = high;
+    gameResetChangedMs = millis();
+  }
+  if (high == stableGameResetHigh ||
+      millis() - gameResetChangedMs < GAMERESET_DEBOUNCE_MS) {
+    return;
+  }
+  stableGameResetHigh = high;
+  if (high) {
+    // C6の物理ボタン -> GATT準備 -> RX,GAMERESET -> Godotの2段階操作。
+    requestGameButton();
   }
 }
 
@@ -426,7 +597,20 @@ void pollSerialCommands() {
     }
     if (incoming == '\n') {
       if (serialCommandLength > 0) {
-        sendCommand(serialCommand, serialCommandLength);
+        serialCommand[serialCommandLength] = '\0';
+        if (strcmp(serialCommand, "GAMERESET") == 0 ||
+            strcmp(serialCommand, "CMD,GAMERESET") == 0) {
+          requestGameButton();
+        } else if (strcmp(serialCommand, "CMD,START") == 0) {
+          requestStreamCommand(StreamCommand::start);
+          printf("GAME,WAKING\n");
+        } else if (strcmp(serialCommand, "CMD,STOP") == 0) {
+          requestStreamCommand(StreamCommand::stop);
+        } else if (strcmp(serialCommand, "CMD,RESET") == 0) {
+          requestStreamCommand(StreamCommand::reset);
+        } else {
+          sendCommand(serialCommand, serialCommandLength);
+        }
       }
       serialCommandLength = 0;
       continue;
@@ -447,6 +631,8 @@ void setup() {
   // 完成したRX行をstdioのバッファに留めず、すぐUSBへ渡す。
   setvbuf(stdout, nullptr, _IONBF, 0);
   delay(300);
+  pinMode(GAMERESET_GPIO, INPUT_PULLDOWN);
+  pinMode(GAMERESET_LEGACY_GPIO, INPUT_PULLDOWN);
   printf("BOOT,C6 BLE central\n");
 
   BLEDevice::init("C6Central");
@@ -459,6 +645,9 @@ void setup() {
 
 void loop() {
   flushSerialFrames();
+  pollGameResetPin();
+  // 接続・探索中もSTART/STOPを受け付ける。USB接続は休止中も維持する。
+  pollSerialCommands();
   const LinkState state = linkState.load();
   if (state == LinkState::failed) {
     printf("ERROR,BLE connection or discovery failed: %d\n", linkError.load());
@@ -476,13 +665,17 @@ void loop() {
 
   if (state == LinkState::idle) {
     if (connected) {
-      printf("BLE disconnected; will rescan\n");
+      printf(centralSleeping ? "BLE sleeping; scan paused\n" :
+                               "BLE disconnected; will rescan\n");
     }
     connected = false;
-    initialCommandSent = false;
+    if (centralSleeping) {
+      delay(1);
+      return;
+    }
     // 切断中は再スキャンし、見つけたMG24への接続と通知購読をやり直す。
     if (!scanForPeripheral()) {
-      delay(250);
+      delay(1);
       return;
     }
     if (!connectToPeripheral()) {
@@ -521,9 +714,20 @@ void loop() {
   if (!connected) {
     connected = true;
     streamingExpected = true;
-    connectedAtMs = millis();
-    lastDataFrameMs.store(connectedAtMs);
+    lastDataFrameMs.store(millis());
+    acknowledgedCommand.store(StreamCommand::none);
+    dataAfterStartAck.store(false);
+    commandAttempted = false;
+    if (pendingStreamCommand == StreamCommand::none) {
+      pendingStreamCommand = streamWanted ? StreamCommand::start : StreamCommand::stop;
+    }
     printf("BLE subscribed; bidirectional GATT ready\n");
+  }
+
+  if (gameButtonPending) {
+    // 物理押下はGATT接続・通知購読を確立してからGodotへ届ける。
+    printf("RX,GAMERESET\n");
+    gameButtonPending = false;
   }
 
   if (streamingExpected && millis() - lastDataFrameMs.load() > DATA_TIMEOUT_MS) {
@@ -535,11 +739,15 @@ void loop() {
     return;
   }
 
-  if (!initialCommandSent && millis() - connectedAtMs >= 250) {
-    sendCommand("CMD,RESET", strlen("CMD,RESET"));
-    initialCommandSent = true;
+  if (pendingStreamCommand != StreamCommand::none && commandAttempted &&
+      acknowledgedCommand.load() != pendingStreamCommand &&
+      millis() - firstCommandAtMs > DATA_TIMEOUT_MS) {
+    printf("ERROR,BLE command ACK timed out; reconnecting\n");
+    failLink(BLE_HS_ETIMEOUT);
+    return;
   }
-  pollSerialCommands();
+
+  serviceStreamCommand();
   flushSerialFrames();
   delay(1);
 }
