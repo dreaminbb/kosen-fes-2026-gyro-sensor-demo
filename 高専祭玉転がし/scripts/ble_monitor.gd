@@ -5,6 +5,7 @@
 extends Control
 
 const BallPlatform = preload("res://scripts/ball_platform.gd")
+const FallHistoryChart = preload("res://scripts/fall_history_chart.gd")
 const BAUD_RATE := 115200
 const MAX_SERIAL_LINE_BYTES := 16384
 const SERIAL_READ_CHUNK_BYTES := 8192
@@ -28,10 +29,10 @@ const MOCHA_PEACH := Color("#fab387")
 const MOCHA_MAUVE := Color("#cba6f7")
 const MOCHA_RED := Color("#f38ba8")
 
-# RESET/起動からこの秒数待ってMG24へSTOPを送る（既定180秒 = 3分）。
+# RESET/起動からこの秒数待ってMG24へSTOPを送る（既定180秒 = 3分sss）。
 @export_range(0.0, 3600.0, 1.0) var mg24_stop_delay_seconds := 180.0
 # デバッグ用。1〜3を指定すると、そのステージから開始・リセットする。
-@export_range(1, 3, 1) var debug_start_stage := 3
+@export_range(1, 3, 1) var debug_start_stage := 1
 
 enum GameState { WAITING, WAKING, PLAYING }
 var game_state := GameState.WAITING
@@ -89,6 +90,10 @@ var connection_panel: PanelContainer
 var connection_panel_button: Button
 var connection_status_label: Label
 var telemetry_detail_label: Label
+var fall_chart: Control
+var fall_chart_panel: PanelContainer
+var fall_chart_heading: Label
+var last_fall_history_size := -1
 
 
 func _ready() -> void:
@@ -138,6 +143,7 @@ func _process(delta: float) -> void:
 		ball_status_elapsed = 0.0
 		ball_status_label.text = ball_game.get_game_status() + "  |  %.2f m/秒" % ball_game.ball.linear_velocity.length()
 		_update_stats()
+		_update_fall_chart()
 		_refresh_sensor_labels()
 		_update_waiting_overlay()
 
@@ -165,6 +171,7 @@ func _build_ui() -> void:
 	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(overlay)
 	_create_sensor_orientation_card(overlay)
+	_create_fall_history_chart(overlay)
 
 	var top_right := HBoxContainer.new()
 	top_right.add_theme_constant_override("separation", 10)
@@ -332,6 +339,40 @@ func _build_ui() -> void:
 	top_right.reparent(self)
 	game_controls.reparent(self)
 	connection_panel.reparent(self)
+	fall_chart_panel.reparent(self)
+
+
+func _create_fall_history_chart(overlay: Control) -> void:
+	fall_chart_panel = _make_game_panel("FallHistory")
+	_set_panel_rect(fall_chart_panel, 1.0, 0.5, 1.0, 0.5, Vector4(-470, -190, -24, 190))
+	fall_chart_panel.custom_minimum_size = Vector2(446, 380)
+	fall_chart_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	overlay.add_child(fall_chart_panel)
+	var layout := VBoxContainer.new()
+	layout.add_theme_constant_override("separation", 2)
+	fall_chart_panel.add_child(layout)
+	fall_chart_heading = Label.new()
+	fall_chart_heading.text = "区間別落下数 0回 · 横: CP区間 縦: 回数 · S1青 S2紫 S3緑"
+	fall_chart_heading.add_theme_color_override("font_color", MOCHA_TEAL)
+	fall_chart_heading.add_theme_font_size_override("font_size", 11)
+	layout.add_child(fall_chart_heading)
+	fall_chart = FallHistoryChart.new()
+	fall_chart.custom_minimum_size = Vector2(410, 330)
+	fall_chart.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	fall_chart.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	fall_chart.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	layout.add_child(fall_chart)
+
+
+func _update_fall_chart() -> void:
+	if not is_instance_valid(fall_chart) or not is_instance_valid(ball_game):
+		return
+	var records: Array[Dictionary] = ball_game.fall_history
+	if records.size() == last_fall_history_size:
+		return
+	last_fall_history_size = records.size()
+	fall_chart_heading.text = "区間別落下数 %d回 · 横: CP区間 縦: 回数 · S1青 S2紫 S3緑" % records.size()
+	fall_chart.set_fall_records(records)
 
 
 func _create_waiting_overlay() -> void:
@@ -420,6 +461,7 @@ func _update_game_state(delta: float) -> void:
 
 func _update_waiting_overlay() -> void:
 	waiting_overlay.visible = game_state != GameState.PLAYING
+	fall_chart_panel.visible = game_state == GameState.PLAYING
 	game_button.disabled = game_state == GameState.WAKING
 	game_button.text = "リセット" if game_state == GameState.PLAYING else ("再開" if show_resume_prompt else "スタート")
 	if game_state == GameState.WAKING or button_link_pending:

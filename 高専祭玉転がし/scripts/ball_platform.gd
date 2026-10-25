@@ -81,6 +81,7 @@ var bridge_label: Label3D
 var seesaw: AnimatableBody3D
 var seesaw_angle := 0.0
 var stage_banner: Label3D
+var fall_history: Array[Dictionary] = []
 
 
 func _ready() -> void:
@@ -129,9 +130,33 @@ func _physics_process(delta: float) -> void:
 		or absf(local_ball_position.z) > COURSE_LENGTH * 0.5 + 3.0
 	):
 		fall_count += 1
+		fall_history.append({
+			"stage": stage_index + 1,
+			"section": _get_fall_section(local_ball_position.z),
+			"progress": clampf(COURSE_LENGTH * 0.5 - local_ball_position.z, 0.0, COURSE_LENGTH),
+			"lateral": local_ball_position.x,
+		})
 		_drop_ball()
 		return
 	_update_course_progress(local_ball_position)
+
+
+func _get_fall_section(course_z: float) -> int:
+	if stage_index == 0:
+		if course_z > CHECKPOINTS[0].z:
+			return 0
+		if course_z > CHECKPOINTS[1].z:
+			return 1
+		if course_z > CHECKPOINTS[2].z:
+			return 2
+		return 3
+	if stage_index == 1:
+		if course_z > STAGE_2_CHECKPOINTS[0].z:
+			return 0
+		if course_z > STAGE_2_CHECKPOINTS[1].z:
+			return 1
+		return 2
+	return 0 if course_z > STAGE_3_POLE_CENTER_Z else 1
 
 
 func _process(_delta: float) -> void:
@@ -429,7 +454,7 @@ func _build_seesaw() -> void:
 	fulcrum_mesh.position = Vector3(0.0, STAGE_2_SEESAW_PIVOT_HEIGHT * 0.5, -17.0)
 	fulcrum_mesh.material_override = _make_material(MOCHA_YELLOW)
 	platform.add_child(fulcrum_mesh)
-	_add_course_label("SEESAW", Vector3(0.0, STAGE_2_SEESAW_PIVOT_HEIGHT + 0.2, -17.0), MOCHA_YELLOW)
+	# _add_course_label("SEESAW", Vector3(0.0, STAGE_2_SEESAW_PIVOT_HEIGHT + 0.2, -17.0), MOCHA_YELLOW)
 
 
 func _add_seesaw_entry_ramp() -> void:
